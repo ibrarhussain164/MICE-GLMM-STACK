@@ -4,7 +4,7 @@
 # 15 Numeric-Predictor Binary Clinical / Epidemiological Datasets
 #
 # Authors  : Ibrar Hussain, Sohail Akhtar, Xinyi Cao, Can Liu,
-#            Yiqing Gu, Zaixiang Tang
+#            Yiqing Gu, Shahzaib Rafiq, Zaixiang Tang
 # Contact  : tangzx@suda.edu.cn
 # Repository: https://github.com/ibrarhussain164/MICE-GLMM-STACK
 #
