@@ -13,33 +13,33 @@
 # MICE-GLMM-Stack internally pools 3 more MICE base methods (cart, norm, rf)
 # in addition to pmm -- see Sec.11b -- but only MICE-PMM is reported as its own
 # standalone competitive row; MICE-CART/Norm/RF remain internal-only inputs
-# to the pooled stack (midastouch dropped -- see Sec.9c.)
+# to the pooled stack.
 # (MIE_PMM_AVG removed: it duplicated MICE-PMM's PMM-averaging procedure --
 # same imputation method, same 5-draw average -- differing only by RNG seed,
 # with no separate analytical purpose of its own.)
 
+#
 # METHODS:
 #   Complete        : complete-data reference (no missing, no imputation)
+#   CCA             : complete case analysis (listwise deletion of training
+#                  rows with any missing predictor cell; no imputation)
 #   MeanSI          : mean single imputation
 #   KNN             : VIM::kNN single imputation
 #   RFI             : missForest single imputation
-#   CCA             : complete case analysis (listwise deletion of training
-#                  rows with any missing predictor cell; no imputation)
 #   MICE-PMM        : individual MICE base-method result, per classifier
 #                  (m=5 draws, averaged) -- the only individual MICE base
 #                  method reported as a standalone competitor; MICE-GLMM-Stack
 #                  internally also pools cart/norm/rf (see below) but those
-#                  are not reported as their own rows (midastouch dropped
-#                  from the whole pipeline -- see Sec.9c)
+#                  are not reported as their own rows
+#   MIE-SE      : Paper-style stacking -- Aleryani (2020); per meta-clf:
+#                  MIE-SE/J48, MIE-SE/NB, MIE-SE/PART, MIE-SE/SMO, MIE-SE/RF
 #   MICE-GLMM-Stack : pooled 3-random-effect GLMM meta-learner spanning
 #                  ALL 5 classifiers (J48/NB/PART/SMO/RF) x 4 MICE base
 #                  methods (pmm/cart/norm/rf) x M_IMP_STACK=5 draws each =
-#                  100 OOF/test probability streams per split (midastouch
-#                  dropped -- redundant with pmm's donor-matching family, and
-#                  the most compute-heavy of the donor methods; removing it
-#                  preserves coverage of every imputation paradigm --
-#                  matching/parametric/single-tree/ensemble -- while cutting
-#                  cost), modelling THREE sources of variation:
+#                  100 OOF/test probability streams per split, covering
+#                  every major imputation paradigm (matching, parametric,
+#                  single-tree, ensemble), modelling THREE sources of
+#                  variation:
 #                    (1) base classifier   J48/NB/PART/SMO/RF  (random slope)
 #                    (2) MICE base method  pmm/cart/norm/rf
 #                    (3) imputation draw   nested within method (m=1..5)
@@ -48,8 +48,6 @@
 #                  with a fallback formula ladder if the full model fails to
 #                  converge (see Sec.9c). Reported ONCE per split as
 #                  Classifier = "All" (pooled across classifiers and methods).
-#   MIE-SE      : Paper-style stacking -- Aleryani (2020); per meta-clf:
-#                  MIE-SE/J48, MIE-SE/NB, MIE-SE/PART, MIE-SE/SMO, MIE-SE/RF
 #
 # NOTE: MICE-GLMM-Stack reports Classifier = "All" only (one pooled value
 # per split). The CCA and MICE-PMM rows remain per classifier, as does
@@ -131,11 +129,17 @@ mech_labels <- c(MCAR = "MCAR -- Completely At Random",
 # --- MICE base-method settings ---------------------------------------------
 MICE_STACK_METHODS <- c("pmm", "cart", "norm", "rf")
 M_IMP_STACK         <- M_IMP   # draws per base method (5), per user confirmation
+# mice method codes -> paper terminology: pmm = predictive mean matching,
+# cart = classification and regression trees, norm = Bayesian linear
+# regression, rf = random-forest imputation (see Section 2.3 of the paper).
 MICE_METHOD_LABEL   <- c(pmm = "MICE-PMM", cart = "MICE-CART", norm = "MICE-Norm",
                          rf = "MICE-RF")
-METHOD_ORDER <- c("Complete", "MeanSI", "KNN", "RFI", "CCA",
-                  "MICE-PMM",
-                  "MICE-GLMM-Stack", "MIE-SE")
+# Reporting order matches Table 2 of the paper: no imputation (CCA), then
+# single imputation (MeanSI, KNN, RFI), then multiple imputation (MICE-PMM),
+# then stacking (MIE-SE), then the proposed method (MICE-GLMM-Stack) last.
+METHOD_ORDER <- c("Complete", "CCA", "MeanSI", "KNN", "RFI",
+                  "MICE-PMM", "MIE-SE",
+                  "MICE-GLMM-Stack")
 OUTPUT_DIR  <- "~/Desktop/project4/GLMM-stack/GLMM-stack/GLMM-stack-mice"
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
 DATA_DIR    <- "~/Desktop/project4/GLMM-stack/data"
@@ -1062,13 +1066,19 @@ write.csv(grand_summ,
 cat("Saved: summaries\n")
 # --- 16. Wilcoxon Signed-Rank Tests -------------------------------------------
 # NOTE: Updated to the FULL 30-comparison family (6 baselines x 5 classifiers):
-# MeanSI, KNN, RFI, CCA, MICE-PMM, and MIE-SE, each crossed with J48/NB/PART/SMO/RF.
-# This matches the design reported throughout the paper (Section 2.8), where
-# CCA and MICE-PMM are included in the formal Wilcoxon family for completeness,
+# CCA, MeanSI, KNN, RFI, MICE-PMM, and MIE-SE, each crossed with J48/NB/PART/SMO/RF.
+# This matches the design reported throughout the paper (Section 2.8). Each
+# (MissRate x Mechanism x Metric) combination corresponds to one of the 20
+# "strata" referred to in the paper's Discussion (Section 2.8 defines this
+# term as the 5 rates x 2 mechanisms x 2 metrics combinations). CCA and
+# MICE-PMM are included in the formal Wilcoxon family for completeness,
 # notwithstanding the two caveats noted there (CCA discards the missingness
 # mechanism entirely; MICE-PMM is one of the four MICE base methods pooled
 # inside MICE-GLMM-Stack itself).
-INNER_FAMILY_METHODS <- c("MeanSI", "KNN", "RFI", "CCA", "MICE-PMM", "MIE-SE")
+# Reporting order matches the paper's Wilcoxon tables (Tables 5-6, S21-S40):
+# CCA first (no imputation), then single imputation (MeanSI, KNN, RFI),
+# then MICE-PMM (multiple imputation), then MIE-SE (stacking).
+INNER_FAMILY_METHODS <- c("CCA", "MeanSI", "KNN", "RFI", "MICE-PMM", "MIE-SE")
 STACK_METHODS <- c("MICE-GLMM-Stack")
 STACK_CLF     <- "All"
 ds_level_wt <- combined %>%
@@ -1655,14 +1665,17 @@ build_rank_table <- function(data_in, miss_rate_val, metric = "AUC",
       MethodClf = paste(Method, Classifier, sep = "/")
     )
   
+  # Reporting order matches the paper's rank tables (Supplementary S1-S20):
+  # CCA first, then single imputation, then MICE-PMM, then MIE-SE, then the
+  # proposed MICE-GLMM-Stack.
   row_order <- c(
+    paste("CCA",             CLF_NAMES, sep="/"),
     paste("MeanSI",          CLF_NAMES, sep="/"),
     paste("KNN",             CLF_NAMES, sep="/"),
     paste("RFI",             CLF_NAMES, sep="/"),
-    paste("CCA",             CLF_NAMES, sep="/"),
     paste("MICE-PMM",        CLF_NAMES, sep="/"),
-    "MICE-GLMM-Stack/All",
-    paste("MIE-SE",         CLF_NAMES, sep="/")
+    paste("MIE-SE",         CLF_NAMES, sep="/"),
+    "MICE-GLMM-Stack/All"
   )
   row_order <- row_order[row_order %in% unique(agg$MethodClf)]
   
