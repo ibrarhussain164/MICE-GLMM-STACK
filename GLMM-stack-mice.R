@@ -1,137 +1,81 @@
 # =============================================================================
-# Multi_HAS_Pipeline.R — 15 Numeric-Predictor Binary Clinical / Epidemiological Datasets
-# MICE-GLMM-Stack: pooled 3-random-effect GLMM stacking benchmark
+# MICE-GLMM-Stack: main benchmark
+#
+# Fifteen public clinical datasets with a binary outcome and numeric
+# predictors. Missing values are induced in the training data (MCAR and a
+# severity-weighted MAR mechanism, 10% to 50%), and seven strategies are
+# compared over 10 stratified 70/30 splits:
+#
+#   CCA              complete-case analysis
+#   MeanSI           mean single imputation
+#   KNN              k-nearest-neighbour imputation (VIM::kNN)
+#   RFI              random-forest imputation (missForest)
+#   MICE-PMM         MICE with predictive mean matching, m = 5, probabilities
+#                    averaged over the draws
+#   MIE-SE           multiple imputation ensemble with stacking (Aleryani et
+#                    al. 2020)
+#   MICE-GLMM-Stack  proposed method (see below)
+#
+# Each strategy except MICE-GLMM-Stack is reported with five classifiers:
+# J48 (C5.0 tree), NB (naive Bayes), PART (C5.0 rules), SMO (linear SVM,
+# e1071::svm) and RF (random forest). "SMO" is only the internal label of the
+# SVM; it is called SVM in the paper.
+#
+# MICE-GLMM-Stack
+#   1. Impute the training data with four MICE methods (pmm, cart, norm, rf),
+#      five draws each.
+#   2. Score every draw with the five classifiers (10-fold out-of-fold
+#      predictions on the training data, refit for the test data).
+#   3. Average the five draws of each classifier x method combination, which
+#      leaves 20 prediction streams per subject.
+#   4. Fit the GLMM
+#        y ~ logit_p + (logit_p | classifier) + (1 | method)
+#      with glmer. If no model is returned, the fallback sequence is
+#      (ii) no random slope, (iii) no method intercept, (iv) simple mean.
+#   5. The prediction for a test subject is the mean of its 20 fitted
+#      probabilities.
+#
+# Further output: meta-learner ablation on the same streams, convergence and
+# singularity diagnostics, variance decomposition (classifier variance as a
+# function of x = logit p), Wilcoxon tests with Bonferroni correction,
+# Kendall's W, split-level mixed-model tests and runtime per method.
+#
+# Data: one CSV per dataset in DATA_DIR, outcome column "y" (see read_ds()).
+# Results are written to OUTPUT_DIR. Finished datasets are stored as
+# checkpoints, so an interrupted run can simply be restarted.
 # =============================================================================
-#
-# INCLUSION CRITERIA:
-#   [OK] Binary outcome (no censoring, no survival time)
-#   [OK] All retained predictors are numeric-valued; nominal, ordinal, and
-#     binary-coded categorical predictors were excluded
-#   [OK] Clinical or epidemiological domain
-#
-# MIE-SE uses MICE-PMM exclusively (all predictors numeric-valued).
-# MICE-GLMM-Stack internally pools 3 more MICE base methods (cart, norm, rf)
-# in addition to pmm -- see Sec.11b -- but only MICE-PMM is reported as its own
-# standalone competitive row; MICE-CART/Norm/RF remain internal-only inputs
-# to the pooled stack.
-# (MIE_PMM_AVG removed: it duplicated MICE-PMM's PMM-averaging procedure --
-# same imputation method, same 5-draw average -- differing only by RNG seed,
-# with no separate analytical purpose of its own.)
-
-#
-# METHODS:
-#   Complete        : complete-data reference (no missing, no imputation)
-#   CCA             : complete case analysis (listwise deletion of training
-#                  rows with any missing predictor cell; no imputation)
-#   MeanSI          : mean single imputation
-#   KNN             : VIM::kNN single imputation
-#   RFI             : missForest single imputation
-#   MICE-PMM        : individual MICE base-method result, per classifier
-#                  (m=5 draws, averaged) -- the only individual MICE base
-#                  method reported as a standalone competitor; MICE-GLMM-Stack
-#                  internally also pools cart/norm/rf (see below) but those
-#                  are not reported as their own rows
-#   MIE-SE      : Paper-style stacking -- Aleryani (2020); per meta-clf:
-#                  MIE-SE/J48, MIE-SE/NB, MIE-SE/PART, MIE-SE/SMO, MIE-SE/RF
-#   MICE-GLMM-Stack : pooled 3-random-effect GLMM meta-learner spanning
-#                  ALL 5 classifiers (J48/NB/PART/SMO/RF) x 4 MICE base
-#                  methods (pmm/cart/norm/rf) x M_IMP_STACK=5 draws each =
-#                  100 OOF/test probability streams per split, covering
-#                  every major imputation paradigm (matching, parametric,
-#                  single-tree, ensemble), modelling THREE sources of
-#                  variation:
-#                    (1) base classifier   J48/NB/PART/SMO/RF  (random slope)
-#                    (2) MICE base method  pmm/cart/norm/rf
-#                    (3) imputation draw   nested within method (m=1..5)
-#                  combined via:
-#                    y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id/draw_id)
-#                  with a fallback formula ladder if the full model fails to
-#                  converge (see Sec.9c). Reported ONCE per split as
-#                  Classifier = "All" (pooled across classifiers and methods).
-#
-# NOTE: MICE-GLMM-Stack reports Classifier = "All" only (one pooled value
-# per split). The CCA and MICE-PMM rows remain per classifier, as does
-# MIE-SE.
-#
-# COMPARISON DESIGN (Sec.16): The pooled MICE-GLMM-Stack/All result is compared
-# via paired Wilcoxon signed-rank tests against every (imputation method x
-# classifier) combination -- MeanSI, KNN, RFI, CCA, MICE-PMM, and MIE-SE, each
-# evaluated with J48/NB/PART/SMO/RF (6 x 5 = 30 competitors). Bonferroni
-# correction is applied within each (MissRate x Metric) family (n_comp = 30).
-# This yields 5 x 2 = 10 tables, each with 30 competitor rows.
-#
-# LITERATURE BASIS FOR THE STACKING GLMM (MICE-GLMM-Stack Sec.9c):
-#   - Rubin (1987, "Multiple Imputation for Nonresponse in Surveys", Wiley)
-#     and van Buuren (2018, "Flexible Imputation of Missing Data", 2nd ed.,
-#     CRC Press) establish that between-imputation variability is a genuine,
-#     estimable source of uncertainty that should be modelled explicitly
-#     rather than discarded by simple averaging across draws -- motivating a
-#     random "imp_id" (draw) effect rather than pre-averaging the m=5 draws.
-#   - Aleryani, Wang & De La Iglesia (2020, the MIE-SE stacking design used
-#     elsewhere in this script), Wolpert (1992, "Stacked Generalization",
-#     Neural Networks 5(2)), and van der Laan, Polley & Hubbard (2007, "Super
-#     Learner", Statistical Applications in Genetics and Molecular Biology
-#     6(1)) justify combining several base classifiers' predictions through a
-#     learned meta-model rather than unweighted averaging -- motivating the
-#     crossed "classifier" random effect, with a random slope on logit_p
-#     since classifiers differ systematically in calibration, not only mean
-#     score.
-#   - Gelman & Hill (2007, "Data Analysis Using Regression and Multilevel/
-#     Hierarchical Models", Cambridge UP, esp. Ch.13) give the standard
-#     guidance for preferring varying-slope + varying-intercept terms when
-#     group-specific calibration is expected -- i.e. (logit_p | clf_id) -- and
-#     a simple random intercept for the imputation-draw source
-#     (1 | method_id/draw_id).
-#   - Bates, Machler, Bolker & Walker (2015, "Fitting Linear Mixed-Effects
-#     Models Using lme4", J. Statistical Software 67(1)) document the
-#     glmer() syntax and fallback strategies used below when the full
-#     varying-slope model fails to converge.
-#   - The MICE base method itself differs systematically in imputation
-#     quality (van Buuren 2018, Ch.3 on method choice), justifying a random
-#     intercept for "method_id", with imputation draws nested within method
-#     (1 | method_id/draw_id) since draws are only exchangeable within the
-#     same method, not across methods -- combined with the crossed classifier
-#     random slope above into y_bin ~ logit_p + (logit_p | clf_id) +
-#     (1 | method_id/draw_id).
-#
-# MISSING MECHANISM : MCAR (primary, following original MIE framework) AND
-#                      MAR (severity-weighted, clinically-motivated; see
-#                      induce_missing() in Sec.3 for design + citations)
-# CLASSIFIERS       : J48, NB, PART, SMO, RF
-# MISS RATES        : 10 20 30 40 50 %  (predictor-cell level; bycases=FALSE)
-# PRIMARY METRIC    : AUC (threshold-independent, robust to class imbalance)
-# SECONDARY METRIC  : Brier score (probability calibration)
-# SPLITS            : 10 stratified 70/30 (caret::createDataPartition)
-# M_IMP             : 5  (draws per MICE base method)
-# MAXIT_MICE        : 20
-# =============================================================================
-# --- 0. Packages ---------------------------------------------------------
+# --- 1. Packages -------------------------------------------------------------
 suppressPackageStartupMessages({
   library(mice); library(VIM); library(missForest)
   library(C50); library(naivebayes); library(e1071); library(randomForest)
   library(rpart)   # required by mice's "cart" imputation method
   library(lme4); library(pROC); library(caret)
+  # DescTools for the Brier score, Metrics as a second AUC implementation
+  for (pk in c("DescTools", "Metrics"))
+    if (!requireNamespace(pk, quietly = TRUE)) install.packages(pk)
   library(dplyr); library(tidyr); library(ggplot2); library(purrr)
 })
 set.seed(2024)
-# --- 1. Settings -----------------------------------------------------------
+# --- 2. Settings -------------------------------------------------------------
 N_SPLITS    <- 10
-MISS_RATES  <- c( 0.1, 0.2, 0.3, 0.40, 0.50)
+if (!exists("MISS_RATES")) MISS_RATES <- c(0.10, 0.20, 0.30, 0.40, 0.50)
 M_IMP       <- 5
 M_IMP_SE    <- 5
-MAXIT_MICE  <- 20
+MAXIT_MICE  <- 5     # mice default
 CV_FOLDS    <- 10
 TRAIN_FRAC  <- 0.70
 CLF_NAMES   <- c("J48", "NB", "PART", "SMO", "RF")
-MISS_MECHS  <- c("MCAR", "MAR")
-mech_labels <- c(MCAR = "MCAR -- Completely At Random",
-                 MAR  = "MAR -- Missing At Random (severity-weighted)")
+if (!exists("MISS_MECHS")) {
+  MISS_MECHS  <- c("MCAR", "MAR")
+  mech_labels <- c(MCAR = "MCAR -- Completely At Random",
+                   MAR  = "MAR -- Missing At Random (severity-weighted)")
+}
 # --- MICE base-method settings ---------------------------------------------
 MICE_STACK_METHODS <- c("pmm", "cart", "norm", "rf")
-M_IMP_STACK         <- M_IMP   # draws per base method (5), per user confirmation
+M_IMP_STACK         <- M_IMP   # draws per MICE method
 # mice method codes -> paper terminology: pmm = predictive mean matching,
 # cart = classification and regression trees, norm = Bayesian linear
-# regression, rf = random-forest imputation (see Section 2.3 of the paper).
+# regression, rf = random-forest imputation.
 MICE_METHOD_LABEL   <- c(pmm = "MICE-PMM", cart = "MICE-CART", norm = "MICE-Norm",
                          rf = "MICE-RF")
 # Reporting order matches Table 2 of the paper: no imputation (CCA), then
@@ -140,10 +84,50 @@ MICE_METHOD_LABEL   <- c(pmm = "MICE-PMM", cart = "MICE-CART", norm = "MICE-Norm
 METHOD_ORDER <- c("Complete", "CCA", "MeanSI", "KNN", "RFI",
                   "MICE-PMM", "MIE-SE",
                   "MICE-GLMM-Stack")
-OUTPUT_DIR  <- "~/Desktop/project4/GLMM-stack/GLMM-stack/GLMM-stack-mice"
+
+# --- Run settings -------------------------------------------------------------
+# SMOKE_TEST = TRUE runs 2 small datasets, 1 split and one rate (about 15 min),
+# to check that everything works before the full run.
+SMOKE_TEST   <- FALSE
+# Include the outcome in the imputation model (as recommended for MI).
+IMPUTE_USE_Y <- TRUE
+# MAR odds-ratio cap: 1:20 in the main analysis, 1:5 for the milder MAR run.
+MAR_ODDS_CAP <- c(MAR = 20, MAR5 = 5)
+# ONLY_MECH = "MCAR" or "MAR" runs one mechanism (e.g. in two R sessions).
+# Afterwards run once more with NULL: the checkpoints are loaded and all
+# tables and figures are written.
+ONLY_MECH    <- NULL
+# "S20": draws averaged before the GLMM (20 rows per subject; main model).
+# "S100": all 100 streams with a draw-within-method term (100-stream model).
+MAIN_STREAMS <- "S20"
+# Save the test-set prediction of every method (a few MB per dataset).
+SAVE_PREDICTIONS <- TRUE
+# Run the meta-learner ablation (set to FALSE in the milder MAR run).
+if (!exists("RUN_ABLATION")) RUN_ABLATION <- TRUE
+
+# Meta-learners fitted to the same prediction streams as MICE-GLMM-Stack.
+# They are reported in separate ablation tables, not in the main tables.
+ABLATION_METHODS <- c("Stack-Avg",          # (a) simple average of all streams
+                      "Stack-LR",           # (b) logistic stacking on 5 classifier logits
+                      "Stack-GLMM-Clf",     # (c) y ~ logit_p + (logit_p | clf_id)
+                      "Stack-GLMM-S100")    # (d) 100-stream model
+if (MAIN_STREAMS == "S100")
+  ABLATION_METHODS[ABLATION_METHODS == "Stack-GLMM-S100"] <- "Stack-GLMM-S20"
+METHOD_ORDER_ALL <- c(METHOD_ORDER, ABLATION_METHODS)
+
+if (SMOKE_TEST) {
+  N_SPLITS   <- 1
+  MISS_RATES <- c(0.30)
+}
+if (!is.null(ONLY_MECH)) MISS_MECHS <- intersect(MISS_MECHS, ONLY_MECH)
+
+if (!exists("OUTPUT_DIR")) OUTPUT_DIR <- "results/main"
+if (SMOKE_TEST)             OUTPUT_DIR <- paste0(OUTPUT_DIR, "-SMOKE")
+if (!IMPUTE_USE_Y)          OUTPUT_DIR <- paste0(OUTPUT_DIR, "-noY")
+if (MAIN_STREAMS == "S100") OUTPUT_DIR <- paste0(OUTPUT_DIR, "-S100main")
 dir.create(OUTPUT_DIR, showWarnings = FALSE, recursive = TRUE)
-DATA_DIR    <- "~/Desktop/project4/GLMM-stack/data"
-# --- 2. Dataset Loaders ------------------------------------------------------
+if (!exists("DATA_DIR")) DATA_DIR <- "data"
+# --- 3. Dataset Loaders ------------------------------------------------------
 read_ds <- function(name) {
   d <- read.csv(file.path(DATA_DIR, paste0(name, ".csv")),
                 stringsAsFactors = FALSE)
@@ -242,13 +226,22 @@ DATASET_REGISTRY <- list(
   list(name = "HCVHepC",             loader = load_hcvhepc),
   list(name = "WPBCBreast",          loader = load_wpbc)
 )
-# --- 3. Missing Data Injection -----------------------------------------------
+# smoke test: two small datasets only
+if (SMOKE_TEST)
+  DATASET_REGISTRY <- Filter(function(d) d$name %in% c("Haberman", "Vertebral"),
+                             DATASET_REGISTRY)
+# --- 4. Missing Data Injection -----------------------------------------------
 induce_missing <- function(X, rate, mech, seed = NULL) {
   if (rate == 0) return(X)
   mech_up <- toupper(mech)
+  # MAR and MAR5 are the same mechanism with a different odds-ratio cap
+  is_mar  <- mech_up %in% c("MAR", "MAR5")
+  or_cap  <- if (is_mar) unname(MAR_ODDS_CAP[mech_up]) else NA_real_
   
   if (!is.null(seed)) {
-    mech_offset <- switch(mech_up, MCAR = 1009L, MAR = 7919L, 4001L)
+    # MAR5 uses the MAR seed offset, so both runs share the same random
+    # draws and differ only in the odds ratio
+    mech_offset <- switch(mech_up, MCAR = 1009L, MAR = 7919L, MAR5 = 7919L, 4001L)
     set.seed(as.integer(seed) + mech_offset)
   }
   
@@ -263,13 +256,13 @@ induce_missing <- function(X, rate, mech, seed = NULL) {
   
   amp_err <- NULL
   amp_result <- suppressMessages(suppressWarnings(tryCatch({
-    if (mech_up == "MAR") {
+    if (is_mar) {
       case_frac <- min(0.999, rate * p / k_needed)
       if (case_frac <= 0.5) {
-        odds_ratio <- 20
+        odds_ratio <- or_cap
       } else {
         x_sat <- 0.5 / case_frac
-        odds_ratio <- max(1.01, min(20, x_sat / (1 - x_sat)))
+        odds_ratio <- max(1.01, min(or_cap, x_sat / (1 - x_sat)))
       }
       strong_odds <- matrix(rep(c(1, odds_ratio), p), nrow = p, byrow = TRUE)
       amp <- mice::ampute(X, prop = rate, mech = "MAR", bycases = FALSE,
@@ -288,12 +281,12 @@ induce_missing <- function(X, rate, mech, seed = NULL) {
   n_cells_total <- nrow(X) * ncol(X)
   n_miss_total  <- max(1L, floor(rate * n_cells_total))
   X_miss <- X
-  if (mech_up == "MAR") {
+  if (is_mar) {
     z <- scale(as.matrix(X))
     z[!is.finite(z)] <- 0
     severity  <- rowMeans(z)
     rank_pct  <- rank(severity, ties.method = "average") / length(severity)
-    odds_row  <- 1 + 19 * rank_pct
+    odds_row  <- 1 + (or_cap - 1) * rank_pct
     p_row     <- odds_row / sum(odds_row)
     cell_prob <- rep(p_row, ncol(X))
     cell_idx  <- sample.int(n_cells_total, size = n_miss_total,
@@ -306,7 +299,7 @@ induce_missing <- function(X, rate, mech, seed = NULL) {
   for (k in seq_along(cell_idx)) X_miss[row_i[k], col_j[k]] <- NA
   X_miss
 }
-# --- 4. Imputation ---------------------------------------------------------
+# --- 5. Imputation -----------------------------------------------------------
 impute_mean <- function(X_tr_miss, X_te_full = NULL) {
   fill_vals <- sapply(X_tr_miss, function(col) {
     fv <- mean(col, na.rm = TRUE); if (is.na(fv)) 0 else fv
@@ -333,7 +326,7 @@ impute_rfi <- function(X_tr_miss, X_te_full = NULL) {
          test  = if (is.null(X_te_full)) NULL else X_te_full)
   }))
 }
-# --- NA FIX HELPER -- applies to every MICE base method (pmm/cart/norm/rf) ---
+# --- 6. Fill any remaining NA after MICE (all four methods) ------------------
 fix_residual_nas <- function(df) {
   for (nm in names(df)) {
     if (any(is.na(df[[nm]]))) {
@@ -346,9 +339,10 @@ fix_residual_nas <- function(df) {
 }
 mice_impute <- function(X_miss, m = M_IMP, y_vec = NULL,
                         seed = 1, maxit = MAXIT_MICE) {
+  if (!IMPUTE_USE_Y) y_vec <- NULL
   df <- if (!is.null(y_vec)) data.frame(X_miss, y = y_vec) else X_miss
   meths <- setNames(rep("pmm", ncol(df)), names(df))
-  meths["y"] <- ""
+  if ("y" %in% names(df)) meths["y"] <- ""   # y is complete, never imputed
   for (nm in names(df)) if (!any(is.na(df[[nm]]))) meths[nm] <- ""
   suppressMessages(suppressWarnings(
     mids <- mice::mice(df, m = m, method = meths,
@@ -360,13 +354,13 @@ mice_impute <- function(X_miss, m = M_IMP, y_vec = NULL,
     fix_residual_nas(comp)
   })
 }
-# --- 4b. MICE imputation by an arbitrary single method (for the 4 individual
-# MICE base-method rows) --------------------------------------------------
+# --- 7. MICE imputation with one given method (pmm, cart, norm or rf) --------
 mice_impute_method <- function(X_miss, method_name, m = M_IMP_STACK, y_vec = NULL,
                                seed = 1, maxit = MAXIT_MICE) {
+  if (!IMPUTE_USE_Y) y_vec <- NULL
   df <- if (!is.null(y_vec)) data.frame(X_miss, y = y_vec) else X_miss
   meths <- setNames(rep(method_name, ncol(df)), names(df))
-  meths["y"] <- ""
+  if ("y" %in% names(df)) meths["y"] <- ""
   for (nm in names(df)) if (!any(is.na(df[[nm]]))) meths[nm] <- ""
   suppressMessages(suppressWarnings(
     mids <- mice::mice(df, m = m, method = meths,
@@ -378,22 +372,34 @@ mice_impute_method <- function(X_miss, method_name, m = M_IMP_STACK, y_vec = NUL
     fix_residual_nas(comp)
   })
 }
-# --- 5. Metrics (fixed threshold = 0.5) -------------------------------------
+# --- 8. Metrics (fixed threshold = 0.5) --------------------------------------
 compute_metrics <- function(probs, labels, thresh = 0.5) {
   probs  <- pmin(pmax(as.numeric(probs), 0), 1)
   lb     <- as.integer(labels == "pos")
-  auc    <- tryCatch(as.numeric(pROC::auc(pROC::roc(lb, probs, quiet = TRUE))),
+  # events (1) are the positive class; equals the Mann-Whitney form of the
+  # AUC with ties counted as 1/2
+  auc    <- tryCatch(as.numeric(pROC::auc(pROC::roc(lb, probs, levels = c(0, 1),
+                                                    direction = "<", quiet = TRUE))),
                      error = function(e) NA_real_)
-  br     <- mean((probs - lb)^2, na.rm = TRUE)
+  # Brier score from DescTools; the plain formula is kept as a check
+  br_formula <- mean((probs - lb)^2, na.rm = TRUE)
+  br <- if (requireNamespace("DescTools", quietly = TRUE))
+          tryCatch(as.numeric(DescTools::BrierScore(x = lb, pred = probs)),
+                   error = function(e) br_formula) else br_formula
+  # independent AUC implementation, used as a check
+  auc_metrics <- if (requireNamespace("Metrics", quietly = TRUE))
+                   tryCatch(as.numeric(Metrics::auc(actual = lb, predicted = probs)),
+                            error = function(e) NA_real_) else NA_real_
   pred_p <- (probs >= thresh); act_p <- (lb == 1)
   tp <- sum( pred_p &  act_p); fp <- sum( pred_p & !act_p)
   tn <- sum(!pred_p & !act_p); fn <- sum(!pred_p &  act_p)
   se  <- if ((tp + fn) == 0) NA_real_ else tp / (tp + fn)
   sp  <- if ((tn + fp) == 0) NA_real_ else tn / (tn + fp)
   c(AUC = auc, Brier = br,
-    Sensitivity = se, Specificity = sp, Threshold = thresh)
+    Sensitivity = se, Specificity = sp, Threshold = thresh,
+    AUC_Metrics = auc_metrics, Brier_formula = br_formula)
 }
-# --- 6. Classifier Wrapper ---------------------------------------------------
+# --- 9. Classifier Wrapper ---------------------------------------------------
 fit_clf <- function(clf, X_tr, y_tr, X_te) {
   df_tr <- data.frame(X_tr, y = y_tr)
   df_te <- data.frame(X_te)
@@ -431,7 +437,7 @@ fit_clf <- function(clf, X_tr, y_tr, X_te) {
   if (any(bad)) out[bad] <- 0.5
   pmin(pmax(out, 0), 1)
 }
-# --- 8. MIE-SE -- Paper-Style Stacking (Aleryani 2020) ----------------------
+# --- 10. MIE-SE (Aleryani et al. 2020) ---------------------------------------
 mice_se_l0 <- function(imp_tr, y_tr, imp_te,
                        m_se = M_IMP_SE, oof_folds = CV_FOLDS) {
   m_use   <- min(m_se, length(imp_tr))
@@ -472,7 +478,7 @@ run_mice_se <- function(L0_tr, L0_te, y_tr, meta_clf) {
     fit_clf(meta_clf, df_tr, y_tr, df_te),
     error = function(e) rowMeans(L0_te, na.rm = TRUE))
 }
-# --- 9. MICE base-method imputations ----------------------------------------
+# --- 11. MICE base-method imputations ----------------------------------------
 mice_stack_imputations <- function(X_tr_miss, y_tr, split_seed) {
   setNames(lapply(seq_along(MICE_STACK_METHODS), function(mi) {
     meth <- MICE_STACK_METHODS[mi]
@@ -522,7 +528,7 @@ mice_stack_method_scores <- function(clf, imp_draws_list, y_tr, X_te_full,
   test_mat[is.na(test_mat)] <- 0.5
   list(oof = oof_mat, test = test_mat, oof_draws = oof_draws, test_draws = test_draws)
 }
-# --- 9c. MICE-GLMM-Stack -- pooled 3-random-effect GLMM meta-learner --------
+# --- 12. MICE-GLMM-Stack: long-format data for the GLMM ----------------------
 build_pooled_glmm_stack_data <- function(stack_scores_by_clf, y_tr) {
   rows_tr <- list(); rows_te <- list()
   clf_ids <- names(stack_scores_by_clf)
@@ -541,6 +547,7 @@ build_pooled_glmm_stack_data <- function(stack_scores_by_clf, y_tr) {
           draw_id   = factor(di, levels = seq_len(M_IMP_STACK)),
           method_id = factor(meth, levels = MICE_STACK_METHODS),
           clf_id    = factor(cl, levels = CLF_NAMES),
+          obs_id    = seq_len(nrow(oof_mat)),
           stringsAsFactors = FALSE)
       }
       for (di in seq_len(ncol(test_mat))) {
@@ -557,67 +564,248 @@ build_pooled_glmm_stack_data <- function(stack_scores_by_clf, y_tr) {
   if (length(rows_tr) == 0 || length(rows_te) == 0) return(NULL)
   
   long_tr <- do.call(rbind, rows_tr)
+  # probabilities truncated to [1e-6, 1 - 1e-6] so that the logit is finite
   long_tr$logit_p <- qlogis(pmin(pmax(long_tr$p, 1e-6), 1 - 1e-6))
   long_te <- do.call(rbind, rows_te)
   long_te$logit_p <- qlogis(pmin(pmax(long_te$p, 1e-6), 1 - 1e-6))
   list(long_tr = long_tr, long_te = long_te)
 }
+# Fits one GLMM and returns the model with its diagnostics: whether a model
+# was returned, convergence warning, isSingular() and fit time. do.call() is
+# used so that an optional weights vector is passed correctly to glmer().
+fit_glmer_diag <- function(f, data, maxfun = 5e5, weights = NULL) {
+  ctrl <- glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = maxfun),
+                       check.conv.singular = .makeCC("ignore", tol = 1e-4))
+  args <- list(formula = f, data = data, family = binomial(), control = ctrl)
+  if (!is.null(weights)) args$weights <- weights
+  t0  <- Sys.time()
+  mod <- suppressMessages(suppressWarnings(
+    tryCatch(do.call(lme4::glmer, args), error = function(e) NULL)))
+  secs <- as.numeric(difftime(Sys.time(), t0, units = "secs"))
+  if (is.null(mod))
+    return(list(mod = NULL, ok = FALSE, conv_warn = NA, singular = NA, secs = secs))
+  conv_msgs <- tryCatch(mod@optinfo$conv$lme4$messages, error = function(e) NULL)
+  opt_code  <- tryCatch(mod@optinfo$conv$opt, error = function(e) 0)
+  list(mod       = mod,
+       ok        = TRUE,
+       # model returned, but lme4 reported a convergence warning
+       conv_warn = (length(conv_msgs) > 0) || (!is.null(opt_code) && opt_code != 0),
+       singular  = lme4::isSingular(mod, tol = 1e-4),
+       secs      = secs)
+}
+
+# Predict the test rows and average them per test subject (obs_id).
+# scale = "prob":  mean of the fitted probabilities (main analysis)
+# scale = "logit": mean on the link scale, then plogis (sensitivity analysis)
+predict_and_aggregate <- function(mod, long_te, scale = "prob") {
+  eta <- predict(mod, long_te, type = "link", allow.new.levels = TRUE, re.form = NULL)
+  val <- if (scale == "prob") plogis(eta) else eta
+  agg <- tapply(val, long_te$obs_id, mean)
+  out <- as.numeric(agg[order(as.integer(names(agg)))])
+  if (scale == "logit") out <- plogis(out)
+  out
+}
+
+# Moments of the training logit_p, used to average the classifier variance
+# s0^2 + 2 x s01 + x^2 s1^2 over the empirical distribution of x
+logit_moments <- function(long_tr) {
+  x <- long_tr$logit_p
+  data.frame(x_mean = mean(x), x_sq_mean = mean(x^2),
+             x_q25 = unname(quantile(x, 0.25)), x_q50 = unname(quantile(x, 0.50)),
+             x_q75 = unname(quantile(x, 0.75)))
+}
+
+extract_vc <- function(mod) tryCatch({
+  vc_raw <- as.data.frame(lme4::VarCorr(mod))
+  vc_raw[, c("grp", "var1", "var2", "vcov", "sdcor")]
+}, error = function(e) NULL)
+
+# Average streams on the probability scale.
+#   keys = c("clf_id", "method_id"): average over draws -> 20 rows per subject
+#   keys = "clf_id": average over methods and draws -> 5 rows per subject
+# y_bin is the same in all rows of a subject, so the first value is used.
+collapse_streams <- function(d, keys, has_y) {
+  a <- aggregate(d$p, by = d[c("obs_id", keys)], FUN = mean)
+  names(a)[ncol(a)] <- "p"
+  if (has_y) {
+    yy <- tapply(d$y_bin, d$obs_id, `[`, 1)
+    a$y_bin <- as.integer(yy[as.character(a$obs_id)])
+  }
+  a$logit_p <- qlogis(pmin(pmax(a$p, 1e-6), 1 - 1e-6))
+  a
+}
+
 run_mice_glmm_stack_pooled <- function(long_data, test_list_fallback) {
   if (is.null(long_data))
     return(list(pred = rowMeans(do.call(cbind, test_list_fallback), na.rm = TRUE),
-                varcomp = NULL, formula_used = 4L))
+                pred_logit = NULL, varcomp = NULL, formula_used = 4L, diag = NULL))
   long_tr <- long_data$long_tr
   long_te <- long_data$long_te
+
+  if (MAIN_STREAMS == "S20") {
+    # Main model: average the 5 draws of each classifier x method combination,
+    # then fit the GLMM to the 20 rows per subject. Rungs (i)-(iii) of the
+    # fallback sequence; rung (iv), the simple mean, is used below if none fits.
+    long_tr <- collapse_streams(long_tr, c("clf_id", "method_id"), TRUE)
+    long_te <- collapse_streams(long_te, c("clf_id", "method_id"), FALSE)
+    formula_ladder <- list(
+      list(f = y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id), mf = 5e5),
+      list(f = y_bin ~ logit_p + (1 | clf_id) + (1 | method_id),       mf = 4e5),
+      list(f = y_bin ~ logit_p + (logit_p | clf_id),                   mf = 3e5)
+    )
+  } else {
+    # 100-stream model (100 rows per subject, draw nested within method)
+    formula_ladder <- list(
+      list(f = y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id/draw_id), mf = 5e5),
+      list(f = y_bin ~ logit_p + (1 | clf_id) + (1 | method_id/draw_id),       mf = 4e5),
+      list(f = y_bin ~ logit_p + (1 | clf_id) + (1 | method_id) + (1 | draw_id), mf = 3e5)
+    )
+  }
   
-  mk_ctrl <- function(maxfun)
-    glmerControl(optimizer = "bobyqa", optCtrl = list(maxfun = maxfun),
-                 check.conv.singular = .makeCC("ignore", tol = 1e-3))
-  
-  formula_ladder <- list(
-    list(f = y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id/draw_id),
-         ctrl = mk_ctrl(5e5)),
-    list(f = y_bin ~ logit_p + (1 | clf_id) + (1 | method_id/draw_id),
-         ctrl = mk_ctrl(4e5)),
-    list(f = y_bin ~ logit_p + (1 | clf_id) + (1 | method_id) + (1 | draw_id),
-         ctrl = mk_ctrl(3e5))
-  )
-  
-  ok <- FALSE; mod <- NULL; formula_used <- NA_integer_
+  fit <- NULL; formula_used <- NA_integer_
   for (fi in seq_along(formula_ladder)) {
-    if (ok) break
-    fc <- formula_ladder[[fi]]
-    suppressMessages(suppressWarnings(tryCatch({
-      mod <- lme4::glmer(fc$f, data = long_tr, family = binomial(),
-                         control = fc$ctrl)
-      ok <- TRUE
-      formula_used <- fi
-    }, error = function(e) NULL)))
+    fit <- fit_glmer_diag(formula_ladder[[fi]]$f, long_tr, formula_ladder[[fi]]$mf)
+    if (fit$ok) { formula_used <- fi; break }
   }
-  if (!ok) {
-    agg_fb <- aggregate(p ~ obs_id, long_te[, c("obs_id", "p")], mean)
-    return(list(pred = agg_fb[order(agg_fb$obs_id), "p"],
-                varcomp = NULL, formula_used = 4L))
+  diag_row <- data.frame(Variant = "MICE-GLMM-Stack",
+                         ok = isTRUE(fit$ok), rung = if (isTRUE(fit$ok)) formula_used else 4L,
+                         conv_warn = fit$conv_warn, singular = fit$singular,
+                         fit_sec = fit$secs, n_rows = nrow(long_tr),
+                         stringsAsFactors = FALSE)
+  if (!isTRUE(fit$ok)) {
+    p_fb <- as.numeric(tapply(long_te$p, long_te$obs_id, mean))
+    return(list(pred = p_fb, pred_logit = NULL, varcomp = NULL,
+                formula_used = 4L, diag = diag_row))
   }
-  long_te$pred <- tryCatch(
-    predict(mod, long_te, type = "response", allow.new.levels = TRUE, re.form = NULL),
-    error = function(e)
-      plogis(predict(mod, long_te, type = "link", allow.new.levels = TRUE, re.form = NULL)))
-  agg <- aggregate(pred ~ obs_id, long_te, mean)
+  mod <- fit$mod
+  pred <- tryCatch(predict_and_aggregate(mod, long_te, "prob"),
+                   error = function(e) as.numeric(tapply(long_te$p, long_te$obs_id, mean)))
+  pred_logit <- tryCatch(predict_and_aggregate(mod, long_te, "logit"),
+                         error = function(e) NULL)
   
-  vc_df <- tryCatch({
-    vc_raw <- as.data.frame(lme4::VarCorr(mod))
-    vc_raw[, c("grp", "var1", "var2", "vcov", "sdcor")]
-  }, error = function(e) NULL)
-  
-  list(pred = agg[order(agg$obs_id), "pred"], varcomp = vc_df, formula_used = formula_used)
+  vc_df <- extract_vc(mod)
+  if (!is.null(vc_df)) {
+    vc_df$singular  <- fit$singular
+    vc_df$conv_warn <- fit$conv_warn
+    vc_df <- cbind(vc_df, logit_moments(long_tr))
+  }
+  list(pred = pred, pred_logit = pred_logit, varcomp = vc_df,
+       formula_used = formula_used, diag = diag_row)
 }
-# --- 12. Single Run ----------------------------------------------------------
+
+# --- 13. Ablation meta-learners (fitting) ------------------------------------
+# All variants use exactly the same out-of-fold and test streams as the main
+# model, so they differ only in the meta-learner.
+run_stack_ablation <- function(long_data) {
+  long_tr <- long_data$long_tr
+  long_te <- long_data$long_te
+  preds <- list(); diags <- list(); vcs <- list()
+  p_avg <- as.numeric(tapply(long_te$p, long_te$obs_id, mean))
+  
+  add_diag <- function(variant, fit, n_rows = nrow(long_tr))
+    diags[[length(diags) + 1]] <<- data.frame(
+      Variant = variant, ok = isTRUE(fit$ok), rung = NA_integer_,
+      conv_warn = fit$conv_warn, singular = fit$singular, fit_sec = fit$secs,
+      n_rows = n_rows, stringsAsFactors = FALSE)
+  
+  # (a) simple average of all streams (same as fallback rung iv)
+  preds[["Stack-Avg"]] <- p_avg
+  
+  # (b) logistic stacking (Wolpert 1992; LeBlanc & Tibshirani 1996): one row
+  #     per subject with the mean logit of each classifier's 20 streams as
+  #     predictors (100 highly correlated columns make glm unstable)
+  wide_logit <- function(d) {
+    m <- tapply(d$logit_p, list(d$obs_id, d$clf_id), mean)
+    m <- m[order(as.integer(rownames(m))), , drop = FALSE]
+    m[is.na(m)] <- 0
+    df <- as.data.frame(m); names(df) <- paste0("z_", colnames(m)); df
+  }
+  preds[["Stack-LR"]] <- tryCatch({
+    w_tr <- wide_logit(long_tr)
+    y_ob <- tapply(long_tr$y_bin, long_tr$obs_id, `[`, 1)
+    w_tr$y_bin <- as.integer(y_ob[order(as.integer(names(y_ob)))])
+    w_te <- wide_logit(long_te)
+    m_lr <- suppressWarnings(glm(y_bin ~ ., data = w_tr, family = binomial()))
+    as.numeric(predict(m_lr, w_te, type = "response"))
+  }, error = function(e) p_avg)
+  
+  # draw-averaged input (20 rows per subject), as for the main model
+  s20_tr <- tryCatch(collapse_streams(long_tr, c("clf_id", "method_id"), TRUE),
+                     error = function(e) NULL)
+  s20_te <- tryCatch(collapse_streams(long_te, c("clf_id", "method_id"), FALSE),
+                     error = function(e) NULL)
+  
+  # per-classifier recalibration with fixed effects (no partial pooling);
+  # fitted for completeness, not reported
+  preds[["Stack-GLM-Clf"]] <- tryCatch({
+    m_gc <- suppressWarnings(glm(y_bin ~ logit_p * clf_id, data = s20_tr,
+                                 family = binomial()))
+    eta <- predict(m_gc, s20_te, type = "link")
+    as.numeric(tapply(plogis(eta), s20_te$obs_id, mean))
+  }, error = function(e) p_avg)
+  
+  # (d) 100-stream model: all 100 streams, draw nested within method
+  f_s100 <- y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id/draw_id)
+  glmm_specs <- list()
+  if (MAIN_STREAMS == "S20")
+    glmm_specs[["Stack-GLMM-S100"]] <- list(f = f_s100, w = NULL)
+  
+  # helper: fit, diagnostics, prediction and variance components
+  fit_and_store <- function(nm, f, dtr, dte, w = NULL, pred_fun = NULL) {
+    fit <- fit_glmer_diag(f, dtr, 5e5, weights = w)
+    add_diag(nm, fit, nrow(dtr))
+    if (!isTRUE(fit$ok)) { preds[[nm]] <<- p_avg; return(invisible(NULL)) }
+    preds[[nm]] <<- tryCatch(
+      if (is.null(pred_fun)) predict_and_aggregate(fit$mod, dte, "prob")
+      else pred_fun(fit$mod, dte),
+      error = function(e) p_avg)
+    vc <- extract_vc(fit$mod)
+    if (!is.null(vc)) {
+      vc$singular <- fit$singular; vc$conv_warn <- fit$conv_warn
+      vcs[[length(vcs) + 1]] <<- cbind(Variant = nm, vc, logit_moments(dtr),
+                                       stringsAsFactors = FALSE)
+    }
+    invisible(NULL)
+  }
+  for (nm in names(glmm_specs))
+    fit_and_store(nm, glmm_specs[[nm]]$f, long_tr, long_te, glmm_specs[[nm]]$w)
+  
+  # PMM streams only (25 rows per subject); fitted for completeness, not reported
+  pmm_tr <- droplevels(long_tr[long_tr$method_id == "pmm", ])
+  pmm_te <- droplevels(long_te[long_te$method_id == "pmm", ])
+  if (nrow(pmm_tr) > 0 && nrow(pmm_te) > 0) {
+    fit_and_store("Stack-GLMM-S25-PMM",
+                  y_bin ~ logit_p + (logit_p | clf_id) + (1 | draw_id), pmm_tr, pmm_te)
+  } else preds[["Stack-GLMM-S25-PMM"]] <- p_avg
+  
+  f_s20 <- y_bin ~ logit_p + (logit_p | clf_id) + (1 | method_id)
+  if (!is.null(s20_tr) && !is.null(s20_te)) {
+    # (c) GLMM with classifier random intercept and slope only
+    fit_and_store("Stack-GLMM-Clf", y_bin ~ logit_p + (logit_p | clf_id), s20_tr, s20_te)
+    # if the 100-stream model is the main model, the 20-stream model goes here
+    if (MAIN_STREAMS == "S100") fit_and_store("Stack-GLMM-S20", f_s20, s20_tr, s20_te)
+    
+  } else {
+    preds[["Stack-GLMM-Clf"]] <- p_avg
+  }
+  
+  list(preds   = preds,
+       diag    = do.call(rbind, diags),
+       varcomp = if (length(vcs)) do.call(rbind, vcs) else NULL)
+}
+# --- 14. Single Run ----------------------------------------------------------
 run_one <- function(miss_mech, miss_rate, split_seed,
                     X_tr_full, y_tr, X_te_full, y_te) {
   rows <- list()
   varcomp_local <- list()
+  diag_local    <- list()   # GLMM diagnostics
+  pred_local    <- list()   # test-set predictions
   rec  <- function(method, clf, test_probs) {
     mt <- compute_metrics(test_probs, y_te)
+    if (SAVE_PREDICTIONS)
+      pred_local[[length(pred_local) + 1]] <<- data.frame(
+        Method = method, Classifier = clf, test_row = seq_along(test_probs),
+        p = as.numeric(test_probs), stringsAsFactors = FALSE)
     data.frame(Method = method, Classifier = clf, t(mt), stringsAsFactors = FALSE)
   }
   
@@ -632,20 +820,26 @@ run_one <- function(miss_mech, miss_rate, split_seed,
   actual_miss <- mean(is.na(X_tr_miss))
   attr(X_tr_miss, "actual_miss_rate") <- actual_miss
   
+  # runtime of each single-imputation method (imputation + 5 classifiers)
+  .t0 <- Sys.time()
   si_mean <- impute_mean(X_tr_miss, X_te_full)
+  for (cl in CLF_NAMES)
+    rows[[length(rows)+1]] <- rec("MeanSI", cl, fit_clf(cl, si_mean$train, y_tr, si_mean$test))
+  add_timing("MeanSI", as.numeric(difftime(Sys.time(), .t0, units = "secs")))
+  .t0 <- Sys.time()
   si_knn  <- tryCatch(impute_knn(X_tr_miss, X_te_full),
                       error = function(e) impute_mean(X_tr_miss, X_te_full))
+  for (cl in CLF_NAMES)
+    rows[[length(rows)+1]] <- rec("KNN", cl, fit_clf(cl, si_knn$train, y_tr, si_knn$test))
+  add_timing("KNN", as.numeric(difftime(Sys.time(), .t0, units = "secs")))
+  .t0 <- Sys.time()
   si_rfi  <- tryCatch(impute_rfi(X_tr_miss, X_te_full),
                       error = function(e) impute_mean(X_tr_miss, X_te_full))
-  for (cl in CLF_NAMES) {
-    rows[[length(rows)+1]] <- rec("MeanSI", cl,
-                                  fit_clf(cl, si_mean$train, y_tr, si_mean$test))
-    rows[[length(rows)+1]] <- rec("KNN",    cl,
-                                  fit_clf(cl, si_knn$train,  y_tr, si_knn$test))
-    rows[[length(rows)+1]] <- rec("RFI",    cl,
-                                  fit_clf(cl, si_rfi$train,  y_tr, si_rfi$test))
-  }
+  for (cl in CLF_NAMES)
+    rows[[length(rows)+1]] <- rec("RFI", cl, fit_clf(cl, si_rfi$train, y_tr, si_rfi$test))
+  add_timing("RFI", as.numeric(difftime(Sys.time(), .t0, units = "secs")))
   
+  .t0_cca <- Sys.time()
   cca_keep <- stats::complete.cases(X_tr_miss)
   X_tr_cca <- X_tr_miss[cca_keep, , drop = FALSE]
   y_tr_cca <- y_tr[cca_keep]
@@ -658,6 +852,7 @@ run_one <- function(miss_mech, miss_rate, split_seed,
     } else rep(0.5, nrow(X_te_full))
     rows[[length(rows)+1]] <- rec("CCA", cl, p_cca_te)
   }
+  add_timing("CCA", as.numeric(difftime(Sys.time(), .t0_cca, units = "secs")))
   
   .t0_se <- Sys.time()
   imp_tr_se <- mice_impute(X_tr_miss, M_IMP_SE, y_tr, split_seed + 1L, MAXIT_MICE)
@@ -720,34 +915,78 @@ run_one <- function(miss_mech, miss_rate, split_seed,
       run_mice_glmm_stack_pooled(glmm_stack_data, fallback_list),
       error = function(e) list(
         pred = rowMeans(do.call(cbind, fallback_list), na.rm = TRUE),
-        varcomp = NULL, formula_used = NA_integer_))
+        pred_logit = NULL, varcomp = NULL, formula_used = NA_integer_, diag = NULL))
     rows[[length(rows)+1]] <- rec("MICE-GLMM-Stack", "All", glmm_result$pred)
     if (!is.null(glmm_result$varcomp) && nrow(glmm_result$varcomp) > 0) {
       varcomp_local[[length(varcomp_local) + 1]] <- data.frame(
-        FormulaRung = glmm_result$formula_used,
+        Variant = "MICE-GLMM-Stack", FormulaRung = glmm_result$formula_used,
         glmm_result$varcomp, stringsAsFactors = FALSE)
     }
+    if (!is.null(glmm_result$diag)) diag_local[[length(diag_local) + 1]] <- glmm_result$diag
+    # GLMM fit time of the proposed model
     add_timing("MICE_GLMM_Stack_MetaFit",
                as.numeric(difftime(Sys.time(), .t0_glmm, units = "secs")))
+    
+    # ablation: same streams, other meta-learners
+    if (RUN_ABLATION && !is.null(glmm_stack_data)) {
+      .t0_abl <- Sys.time()
+      abl <- tryCatch(run_stack_ablation(glmm_stack_data), error = function(e) NULL)
+      if (!is.null(abl)) {
+        for (nm in names(abl$preds))
+          rows[[length(rows)+1]] <- rec(nm, "All", abl$preds[[nm]])
+        if (!is.null(abl$diag))    diag_local[[length(diag_local) + 1]] <- abl$diag
+        # each ablation variant has a single formula (rung 1)
+        if (!is.null(abl$varcomp)) varcomp_local[[length(varcomp_local) + 1]] <-
+            data.frame(FormulaRung = 1L, abl$varcomp, stringsAsFactors = FALSE)
+      }
+      # same model, aggregation on the logit scale (sensitivity analysis)
+      if (!is.null(glmm_result$pred_logit))
+        rows[[length(rows)+1]] <- rec("Stack-GLMM-LogitAvg", "All", glmm_result$pred_logit)
+      add_timing("Ablation_Fits",
+                 as.numeric(difftime(Sys.time(), .t0_abl, units = "secs")))
+    }
   }
   
   list(scores  = do.call(rbind, rows),
+       preds   = if (length(pred_local)) do.call(rbind, pred_local) else NULL,
        timing  = do.call(rbind, timing_local),
-       varcomp = do.call(rbind, varcomp_local))
+       varcomp = if (length(varcomp_local)) dplyr::bind_rows(varcomp_local) else NULL,
+       diag    = if (length(diag_local)) do.call(rbind, diag_local) else NULL)
 }
-# --- 13. Main Experiment Loop -------------------------------------------------
+# --- 15. Main Experiment Loop ------------------------------------------------
 cat("\n=== Imputation/Stacking Benchmark -- 15 Numeric-Predictor Binary Clinical Datasets ===\n")
-cat("MICE: PMM only (nominal/ordinal/binary-coded categoricals excluded)\n")
 cat(sprintf("Classifiers: %s | Splits: %d | M_IMP: %d | M_IMP_SE: %d\n",
             paste(CLF_NAMES, collapse="/"), N_SPLITS, M_IMP, M_IMP_SE))
 cat("MIE-SE: separate result per meta-clf (J48/NB/PART/SMO/RF)\n")
-cat(sprintf("MICE-GLMM-Stack: 3-random-effect GLMM (classifier, MICE method, draw-in-method) over %d methods x %d draws x %s classifiers = %d streams, reported once as Classifier=All\n\n",
-            length(MICE_STACK_METHODS), M_IMP_STACK, paste(CLF_NAMES, collapse = "/"),
-            length(MICE_STACK_METHODS) * M_IMP_STACK * length(CLF_NAMES)))
+cat(sprintf("MICE-GLMM-Stack [main = %s]: %d methods x %d draws x %s classifiers = %d streams%s, reported once as Classifier=All\n\n",
+            MAIN_STREAMS, length(MICE_STACK_METHODS), M_IMP_STACK, paste(CLF_NAMES, collapse = "/"),
+            length(MICE_STACK_METHODS) * M_IMP_STACK * length(CLF_NAMES),
+            if (MAIN_STREAMS == "S20") " -> draws averaged -> 20 rows/patient, y ~ logit_p + (logit_p|clf) + (1|method)" else ""))
 all_results <- list()
 all_timings <- list()
 all_varcomp <- list()
+all_diag    <- list()
+# Results of each finished dataset x mechanism are saved as a checkpoint;
+# after an interruption, finished jobs are loaded instead of rerun.
+CKPT_DIR <- file.path(OUTPUT_DIR, "checkpoints")
+dir.create(CKPT_DIR, showWarnings = FALSE, recursive = TRUE)
+PRED_DIR <- file.path(OUTPUT_DIR, "predictions")
+dir.create(PRED_DIR, showWarnings = FALSE, recursive = TRUE)
+# progress log: one row per finished dataset x mechanism
+PROG_FILE  <- file.path(OUTPUT_DIR, "Run_Progress_Log.csv")
+RUN_T0     <- Sys.time()
+N_JOBS     <- length(DATASET_REGISTRY) * length(MISS_MECHS)
+jobs_done  <- 0L; jobs_secs <- c()
 for (ds in DATASET_REGISTRY) {
+  ckpt_of   <- function(mech) file.path(CKPT_DIR, sprintf("%s__%s.rds", ds$name, mech))
+  todo_mech <- MISS_MECHS[!file.exists(vapply(MISS_MECHS, ckpt_of, ""))]
+  for (mech in setdiff(MISS_MECHS, todo_mech)) {      # already finished
+    ck <- readRDS(ckpt_of(mech))
+    all_results <- c(all_results, ck$results); all_timings <- c(all_timings, ck$timings)
+    all_varcomp <- c(all_varcomp, ck$varcomp); all_diag    <- c(all_diag,    ck$diag)
+    cat(sprintf(">>> %s [%s]: loaded from checkpoint\n", ds$name, mech))
+  }
+  if (length(todo_mech) == 0) next
   cat(sprintf(">>> Loading: %s\n", ds$name))
   DATASET <- tryCatch(ds$loader(), error = function(e) {
     message(sprintf("  [SKIP] %s: %s", ds$name, conditionMessage(e))); NULL
@@ -766,7 +1005,10 @@ for (ds in DATASET_REGISTRY) {
               nrow(DATASET), length(PRED_NAMES),
               sum(DATASET$y == "pos"), sum(DATASET$y == "neg")))
   
-  for (mech in MISS_MECHS) {
+  for (mech in todo_mech) {
+    ds_results <- list(); ds_timings <- list(); ds_varcomp <- list(); ds_diag <- list()
+    ds_preds   <- list()
+    .t0_job <- Sys.time(); invisible(gc(reset = TRUE))
     cat(sprintf("  [%s] %s: ", ds$name, mech))
     for (miss_rate in MISS_RATES) {
       cat(sprintf("%g%%", miss_rate * 100))
@@ -790,7 +1032,7 @@ for (ds in DATASET_REGISTRY) {
         base$Dataset      <- ds$name; base$MissMech     <- mech
         base$MissRate     <- 0;       base$Split         <- sp
         base$ActualMiss   <- 0
-        all_results[[length(all_results)+1]] <- base
+        ds_results[[length(ds_results)+1]] <- base
         
         X_tr_miss_check <- tryCatch(
           induce_missing(X_tr, miss_rate, mech, seed = sp_seed), error = function(e) X_tr)
@@ -798,6 +1040,7 @@ for (ds in DATASET_REGISTRY) {
         if (sp == 1)
           cat(sprintf(" [actual=%.1f%%]", actual_miss_pct))
         
+        .t0_split <- Sys.time()
         res_pair <- tryCatch(
           run_one(mech, miss_rate, sp_seed, X_tr, y_tr, X_te, y_te),
           error = function(e) {
@@ -810,20 +1053,39 @@ for (ds in DATASET_REGISTRY) {
           res$Dataset    <- ds$name;   res$MissMech  <- mech
           res$MissRate   <- miss_rate; res$Split      <- sp
           res$ActualMiss <- actual_miss_pct / 100
-          all_results[[length(all_results)+1]] <- res
+          ds_results[[length(ds_results)+1]] <- res
           
-          tmg <- res_pair$timing
+          # predictions with the observed outcome
+          pr <- res_pair$preds
+          if (!is.null(pr) && nrow(pr) > 0) {
+            pr$y <- as.integer(y_te[pr$test_row] == "pos")
+            pr$Dataset <- ds$name; pr$MissMech <- mech
+            pr$MissRate <- miss_rate; pr$Split <- sp
+            ds_preds[[length(ds_preds) + 1]] <- pr
+          }
+          # total time of the split (all methods)
+          tmg <- rbind(res_pair$timing, data.frame(Method = "Split_Total_AllMethods",
+                        RunTime_sec = as.numeric(difftime(Sys.time(), .t0_split, units = "secs")),
+                        stringsAsFactors = FALSE))
           if (!is.null(tmg) && nrow(tmg) > 0) {
             tmg$Dataset  <- ds$name;   tmg$MissMech <- mech
             tmg$MissRate <- miss_rate; tmg$Split     <- sp
-            all_timings[[length(all_timings)+1]] <- tmg
+            tmg$n_train  <- nrow(X_tr); tmg$p        <- length(PRED_NAMES)
+            ds_timings[[length(ds_timings)+1]] <- tmg
           }
           
           vc <- res_pair$varcomp
           if (!is.null(vc) && nrow(vc) > 0) {
             vc$Dataset  <- ds$name;   vc$MissMech <- mech
             vc$MissRate <- miss_rate; vc$Split     <- sp
-            all_varcomp[[length(all_varcomp)+1]] <- vc
+            ds_varcomp[[length(ds_varcomp)+1]] <- vc
+          }
+          
+          dg <- res_pair$diag
+          if (!is.null(dg) && nrow(dg) > 0) {
+            dg$Dataset  <- ds$name;   dg$MissMech <- mech
+            dg$MissRate <- miss_rate; dg$Split     <- sp
+            ds_diag[[length(ds_diag)+1]] <- dg
           }
         }
         cat(".")
@@ -831,18 +1093,46 @@ for (ds in DATASET_REGISTRY) {
       cat(" ")
     }
     cat("done\n")
+    saveRDS(list(results = ds_results, timings = ds_timings,
+                 varcomp = ds_varcomp, diag = ds_diag), ckpt_of(mech))
+    if (SAVE_PREDICTIONS && length(ds_preds))
+      saveRDS(do.call(rbind, ds_preds),
+              file.path(PRED_DIR, sprintf("%s__%s.rds", ds$name, mech)))
+    # progress log with a rough estimate of the remaining time
+    job_sec   <- as.numeric(difftime(Sys.time(), .t0_job, units = "secs"))
+    jobs_done <- jobs_done + 1L; jobs_secs <- c(jobs_secs, job_sec)
+    mem_mb    <- sum(gc()[, ncol(gc())])                    # max memory used (Mb)
+    eta_h     <- mean(jobs_secs) * (N_JOBS - jobs_done) / 3600
+    prog <- data.frame(Dataset = ds$name, MissMech = mech, n = nrow(DATASET),
+                       p = length(PRED_NAMES), n_splits = N_SPLITS * length(MISS_RATES),
+                       Job_minutes = round(job_sec / 60, 2),
+                       Cumulative_hours = round(as.numeric(difftime(Sys.time(), RUN_T0,
+                                                                    units = "hours")), 3),
+                       ETA_remaining_hours_rough = round(eta_h, 2),
+                       Peak_memory_MB = round(mem_mb, 1),
+                       Finished_at = format(Sys.time(), "%Y-%m-%d %H:%M"))
+    write.table(prog, PROG_FILE, sep = ",", row.names = FALSE,
+                col.names = !file.exists(PROG_FILE), append = file.exists(PROG_FILE))
+    cat(sprintf("  -> %.1f min | total %.2f h | remaining ~%.1f h\n",
+                job_sec / 60, prog$Cumulative_hours, eta_h))
+    all_results <- c(all_results, ds_results); all_timings <- c(all_timings, ds_timings)
+    all_varcomp <- c(all_varcomp, ds_varcomp); all_diag    <- c(all_diag,    ds_diag)
   }
 }
 cat("\n=== All runs complete ===\n")
-# --- 14. Combine & Save ------------------------------------------------------
-combined           <- do.call(rbind, all_results)
+# --- 16. Combine & Save ------------------------------------------------------
+# bind_rows fills columns that are missing in some checkpoints with NA
+combined           <- as.data.frame(dplyr::bind_rows(all_results))
 rownames(combined) <- NULL
 combined$MissRate  <- as.numeric(combined$MissRate)
 combined$MissMech  <- factor(combined$MissMech, levels = MISS_MECHS)
-combined$Method    <- factor(combined$Method,   levels = METHOD_ORDER)
+combined$Method    <- factor(combined$Method,   levels = METHOD_ORDER_ALL)
+# rows of variants that are not reported (e.g. Stack-GLM-Clf) become NA and
+# are dropped; their predictions remain in the predictions folder
+combined <- combined[!is.na(combined$Method), ]
 write.csv(combined, file.path(OUTPUT_DIR, "Multi_HAS_results.csv"), row.names = FALSE)
 cat("Saved: Multi_HAS_results.csv\n")
-# --- 14a. Actual Missingness Summary -----------------------------------------
+# --- 17. Actual Missingness Summary ------------------------------------------
 actual_miss_summary <- combined %>%
   dplyr::filter(MissRate > 0) %>%
   dplyr::distinct(Dataset, MissMech, MissRate, Split, ActualMiss) %>%
@@ -860,8 +1150,8 @@ write.csv(actual_miss_summary,
           file.path(OUTPUT_DIR, "Multi_ActualMissingness_Summary.csv"),
           row.names = FALSE)
 cat("Saved: Multi_ActualMissingness_Summary.csv\n")
-# --- 14b. Computational Cost / Runtime Summary -------------------------------
-timing_combined <- do.call(rbind, all_timings)
+# --- 18. Computational Cost / Runtime Summary --------------------------------
+timing_combined <- as.data.frame(dplyr::bind_rows(all_timings))
 if (!is.null(timing_combined) && nrow(timing_combined) > 0) {
   rownames(timing_combined) <- NULL
   write.csv(timing_combined, file.path(OUTPUT_DIR, "Multi_Runtime_Raw.csv"),
@@ -892,12 +1182,19 @@ if (!is.null(timing_combined) && nrow(timing_combined) > 0) {
   cat("Saved: Multi_Runtime_Raw.csv, Multi_Runtime_Summary.csv\n")
   
   runtime_tex_label <- c(
+    CCA                    = "CCA (5 classifiers)",
+    MeanSI                 = "MeanSI (imputation + 5 classifiers)",
+    KNN                    = "KNN (imputation + 5 classifiers)",
+    RFI                    = "RFI (imputation + 5 classifiers)",
     `MIE-SE`               = "MIE-SE (Stacking)",
     MICE_Stack_ImputeScore  = "MICE-GLMM-Stack -- Imputation + Scoring (shared)",
     MICE_GLMM_Stack_MetaFit = "MICE-GLMM-Stack -- Meta-GLMM Fit (incremental)",
-    MICE_GLMM_Stack_Total   = "\\textbf{MICE-GLMM-Stack -- Total}")
-  runtime_order <- c("MIE-SE", "MICE_Stack_ImputeScore",
-                     "MICE_GLMM_Stack_MetaFit", "MICE_GLMM_Stack_Total")
+    MICE_GLMM_Stack_Total   = "\\textbf{MICE-GLMM-Stack -- Total}",
+    Split_Total_AllMethods  = "Whole split, all methods")
+  runtime_order <- c("CCA", "MeanSI", "KNN", "RFI",
+                     "MIE-SE", "MICE_Stack_ImputeScore",
+                     "MICE_GLMM_Stack_MetaFit", "MICE_GLMM_Stack_Total",
+                     "Split_Total_AllMethods")
   
   make_runtime_latex_table <- function(rs, mech) {
     rs <- rs[rs$MissMech == mech, , drop = FALSE]
@@ -925,7 +1222,7 @@ if (!is.null(timing_combined) && nrow(timing_combined) > 0) {
       "MICE base-method imputations and per-classifier out-of-fold scores ",
       "(also reused by the single MICE-PMM reporting row); ",
       "\\textit{Meta-GLMM Fit} is the incremental cost of fitting and ",
-      "predicting the 3-random-effect pooled GLMM on top of that shared ",
+      "predicting the GLMM meta-learner on top of that shared ",
       "step; \\textit{Total} is their sum and is the fair, like-for-like ",
       "figure to compare directly against MIE-SE.")
     lines <- c(
@@ -958,40 +1255,45 @@ if (!is.null(timing_combined) && nrow(timing_combined) > 0) {
 } else {
   cat("[WARN] No timing data captured -- skipping runtime summary/table.\n")
 }
-# --- 14c. Variance-Component Summary ------------------------------------------
-varcomp_combined <- do.call(rbind, all_varcomp)
+# --- 19. Variance-Component Summary ------------------------------------------
+varcomp_combined <- if (length(all_varcomp)) dplyr::bind_rows(all_varcomp) else NULL
+if (!is.null(varcomp_combined))   # reported variants only
+  varcomp_combined <- varcomp_combined[varcomp_combined$Variant %in% c("MICE-GLMM-Stack", ABLATION_METHODS), ]
 if (!is.null(varcomp_combined) && nrow(varcomp_combined) > 0) {
   rownames(varcomp_combined) <- NULL
   write.csv(varcomp_combined,
             file.path(OUTPUT_DIR, "Multi_VarianceComponents_Raw.csv"),
             row.names = FALSE)
   
+  # "draw_id:method_id" in lme4 is the draw nested within method. The
+  # covariance is kept as a separate row because it is not a variance.
   varcomp_combined <- varcomp_combined %>%
     dplyr::mutate(
       Component = dplyr::case_when(
         grp == "clf_id" & var1 == "(Intercept)" & is.na(var2) ~ "Classifier -- intercept",
         grp == "clf_id" & var1 == "logit_p"     & is.na(var2) ~ "Classifier -- slope (logit p)",
         grp == "clf_id" & !is.na(var2)                        ~ "Classifier -- slope/intercept covariance",
-        grp %in% c("draw_id:method_id", "method_id:draw_id")  ~ "Method-within-draw (nested) intercept",
-        grp == "method_id"                                    ~ "Method intercept (crossed)",
+        grp %in% c("draw_id:method_id", "method_id:draw_id")  ~ "Draw-within-method (nested) intercept",
+        grp == "method_id"                                    ~ "Method intercept",
         grp == "draw_id"                                      ~ "Draw intercept (crossed)",
         TRUE ~ paste0(grp, ifelse(is.na(var1), "", paste0(" -- ", var1)))))
   
   varcomp_summary <- varcomp_combined %>%
-    dplyr::group_by(MissMech, Component, FormulaRung) %>%
+    dplyr::group_by(Variant, MissMech, Component, FormulaRung) %>%
     dplyr::summarise(
       N          = dplyr::n(),
       Mean_vcov  = round(mean(vcov,  na.rm = TRUE), 5),
       SD_vcov    = round(sd(vcov,    na.rm = TRUE), 5),
       Mean_sdcor = round(mean(sdcor, na.rm = TRUE), 5),
       .groups = "drop") %>%
-    dplyr::arrange(MissMech, FormulaRung, dplyr::desc(Mean_vcov))
+    dplyr::arrange(Variant, MissMech, FormulaRung, dplyr::desc(Mean_vcov))
   write.csv(varcomp_summary,
             file.path(OUTPUT_DIR, "Multi_VarianceComponents_Summary.csv"),
             row.names = FALSE)
   cat("Saved: Multi_VarianceComponents_Raw.csv, Multi_VarianceComponents_Summary.csv\n")
   
-  rung_share <- varcomp_combined %>%
+  vc_main <- varcomp_combined %>% dplyr::filter(Variant == "MICE-GLMM-Stack")
+  rung_share <- vc_main %>%
     dplyr::distinct(Dataset, MissMech, MissRate, Split, FormulaRung) %>%
     dplyr::count(MissMech, FormulaRung, name = "N_splits") %>%
     dplyr::group_by(MissMech) %>%
@@ -1002,33 +1304,111 @@ if (!is.null(varcomp_combined) && nrow(varcomp_combined) > 0) {
             row.names = FALSE)
   cat("Saved: Multi_VarianceComponents_RungShare.csv\n")
   
+  # --- Variance decomposition ----------------------------------------------
+  # With a random slope, the classifier variance depends on x = logit(p):
+  #   Var_clf(x) = s0^2 + 2 x s01 + x^2 s1^2
+  # In each split it is averaged over the training values of x:
+  #   E[Var_clf] = s0^2 + 2 E[x] s01 + E[x^2] s1^2
+  # Share = E[Var_clf] / (E[Var_clf] + Var_method + Var_draw).
+  # The covariance s01 enters only through this formula. The same function
+  # is used for the main model and the 100-stream model.
+  make_vdec <- function(vc_sub) {
+    per_split_vc <- vc_sub %>%
+      dplyr::filter(FormulaRung == 1) %>%
+      dplyr::mutate(key = dplyr::case_when(
+        Component == "Classifier -- intercept"                  ~ "s0sq",
+        Component == "Classifier -- slope (logit p)"            ~ "s1sq",
+        Component == "Classifier -- slope/intercept covariance" ~ "s01",
+        Component == "Method intercept"                         ~ "v_meth",
+        Component == "Draw-within-method (nested) intercept"    ~ "v_draw",
+        TRUE ~ NA_character_)) %>%
+      dplyr::filter(!is.na(key)) %>%
+      dplyr::select(Dataset, MissMech, MissRate, Split, singular,
+                    x_mean, x_sq_mean, x_q25, x_q50, x_q75, key, vcov) %>%
+      tidyr::pivot_wider(names_from = key, values_from = vcov)
+    for (k in c("s0sq", "s1sq", "s01", "v_meth", "v_draw"))   # absent term = 0
+      if (!k %in% names(per_split_vc)) per_split_vc[[k]] <- 0
+    # slope-intercept correlation, reported separately
+    cor_split <- vc_sub %>%
+      dplyr::filter(FormulaRung == 1,
+                    Component == "Classifier -- slope/intercept covariance") %>%
+      dplyr::select(Dataset, MissMech, MissRate, Split, rho01 = sdcor)
+    per_split_vc <- per_split_vc %>%
+      dplyr::left_join(cor_split, by = c("Dataset", "MissMech", "MissRate", "Split")) %>%
+      dplyr::mutate(
+        dplyr::across(c(s0sq, s1sq, s01, v_meth, v_draw), ~ dplyr::coalesce(.x, 0)),
+        clf_var_avg = s0sq + 2 * x_mean * s01 + x_sq_mean * s1sq,
+        clf_var_q25 = s0sq + 2 * x_q25  * s01 + x_q25^2   * s1sq,
+        clf_var_q50 = s0sq + 2 * x_q50  * s01 + x_q50^2   * s1sq,
+        clf_var_q75 = s0sq + 2 * x_q75  * s01 + x_q75^2   * s1sq,
+        total_var   = clf_var_avg + v_meth + v_draw,
+        share_clf   = clf_var_avg / total_var,
+        share_meth  = v_meth / total_var,
+        share_draw  = v_draw / total_var)
+  
+    vdec_summary <- per_split_vc %>%
+      dplyr::group_by(MissMech) %>%
+      dplyr::summarise(
+        N              = dplyr::n(),
+        # SD = sqrt(mean variance), as in the figure
+        SD_intercept   = sqrt(mean(s0sq)),  SD_slope = sqrt(mean(s1sq)),
+        # correlation from the averaged components, as for the SD curve
+        Corr_int_slope = mean(s01) / sqrt(mean(s0sq) * mean(s1sq)),
+        SD_method      = sqrt(mean(v_meth)), SD_draw = sqrt(mean(v_draw)),
+        ClfVar_avg     = mean(clf_var_avg),
+        ClfVar_q25 = mean(clf_var_q25), ClfVar_q50 = mean(clf_var_q50),
+        ClfVar_q75 = mean(clf_var_q75),
+        MethVar        = mean(v_meth), DrawVar = mean(v_draw),
+        Share_clf_pct  = 100 * mean(share_clf),
+        Share_meth_pct = 100 * mean(share_meth),
+        Share_draw_pct = 100 * mean(share_draw),
+        Pct_singular   = 100 * mean(singular, na.rm = TRUE),
+        .groups = "drop") %>%
+      dplyr::mutate(dplyr::across(where(is.numeric) & !dplyr::all_of("N"), ~ round(.x, 5)))
+    list(per_split = per_split_vc, summary = vdec_summary)
+  }
+  vd <- make_vdec(vc_main)
+  per_split_vc <- vd$per_split; vdec_summary <- vd$summary
+  write.csv(per_split_vc, file.path(OUTPUT_DIR, "Multi_VarianceDecomposition_PerSplit.csv"),
+            row.names = FALSE)
+  write.csv(vdec_summary, file.path(OUTPUT_DIR, "Multi_VarianceDecomposition_Summary.csv"),
+            row.names = FALSE)
+  # decomposition for the 100-stream model (includes the draw share)
+  vc_s100 <- varcomp_combined %>% dplyr::filter(Variant == "Stack-GLMM-S100")
+  if (nrow(vc_s100) > 0) {
+    vd100 <- tryCatch(make_vdec(vc_s100), error = function(e) NULL)
+    if (!is.null(vd100))
+      write.csv(vd100$summary,
+                file.path(OUTPUT_DIR, "Multi_VarianceDecomposition_S100_Summary.csv"),
+                row.names = FALSE)
+  }
+  cat("Saved: Multi_VarianceDecomposition_PerSplit.csv / _Summary.csv\n")
+  print(as.data.frame(vdec_summary))
+  
   make_varcomp_latex_table <- function(vs, mech) {
-    vs1 <- vs %>% dplyr::filter(MissMech == mech, FormulaRung == 1)
-    if (nrow(vs1) == 0)
-      vs1 <- vs %>% dplyr::filter(MissMech == mech,
-                                  FormulaRung == suppressWarnings(min(FormulaRung[MissMech == mech], na.rm = TRUE)))
+    vs1 <- vs %>% dplyr::filter(Variant == "MICE-GLMM-Stack", MissMech == mech, FormulaRung == 1)
+    if (nrow(vs1) == 0) return("")
     cap <- paste0(
       "Empirical variance-component estimates from the pooled MICE-GLMM-Stack ",
       "model (Equation~\\eqref{eq:glmm}), averaged ($\\text{mean}\\pm\\text{SD}$) ",
       sprintf("over every train--test split under the %s missingness mechanism ", mech),
-      "for which the full model (rung~1 of the ",
-      "fallback sequence, Section~\\ref{sec:glmm}) converged. ",
-      "$\\widehat{\\mathrm{sdcor}}$ is the estimated standard deviation (or, for ",
-      "the slope--intercept term, correlation) on the link scale; $N$ is the ",
-      "number of splits contributing to the row.")
+      "fitted with the full specification (rung~1). ",
+      "For the covariance row the last column is the slope--intercept ",
+      "correlation; it is not a variance component and is not included in ",
+      "any variance share. $N$ is the number of splits contributing to the row.")
     lines <- c(
-      "\\begin{table}[!ht]",
-      "  \\centering",
+      "\\begin{table}[!ht]", "  \\centering",
       sprintf("  \\caption{%s}", cap),
       sprintf("  \\label{tab:variance_components_%s}", tolower(mech)),
-      "  \\begin{tabular}{@{}lrrr@{}}",
-      "  \\toprule",
-      "  \\textbf{Random-effects component} & \\textbf{N} & \\textbf{Mean $\\pm$ SD (variance)} & \\textbf{Mean SD/cor} \\\\",
+      "  \\begin{tabular}{@{}lrrr@{}}", "  \\toprule",
+      "  \\textbf{Random-effects component} & \\textbf{N} & \\textbf{Mean $\\pm$ SD (variance or covariance)} & \\textbf{SD ($\\sqrt{\\text{mean var.}}$) / corr.} \\\\",
       "  \\midrule")
     for (i in seq_len(nrow(vs1))) {
       lines <- c(lines, sprintf(
         "  %s & %d & %.4f $\\pm$ %.4f & %.4f \\\\",
-        vs1$Component[i], vs1$N[i], vs1$Mean_vcov[i], vs1$SD_vcov[i], vs1$Mean_sdcor[i]))
+        vs1$Component[i], vs1$N[i], vs1$Mean_vcov[i], vs1$SD_vcov[i],
+        # variance rows: sqrt(mean variance); covariance row: mean correlation
+        if (grepl("covariance", vs1$Component[i])) vs1$Mean_sdcor[i] else sqrt(max(vs1$Mean_vcov[i], 0))))
     }
     lines <- c(lines, "  \\bottomrule", "  \\end{tabular}", "\\end{table}", "")
     paste(lines, collapse = "\n")
@@ -1042,7 +1422,48 @@ if (!is.null(varcomp_combined) && nrow(varcomp_combined) > 0) {
 } else {
   cat("[WARN] No variance-component data captured -- skipping variance-component summary/table.\n")
 }
-# --- 15. Summaries ------------------------------------------------------------
+
+# --- 20. Convergence and singularity diagnostics -----------------------------
+diag_combined <- if (length(all_diag)) as.data.frame(dplyr::bind_rows(all_diag)) else NULL
+if (!is.null(diag_combined))      # reported variants only
+  diag_combined <- diag_combined[diag_combined$Variant %in% c("MICE-GLMM-Stack", ABLATION_METHODS), ]
+if (!is.null(diag_combined) && nrow(diag_combined) > 0) {
+  rownames(diag_combined) <- NULL
+  write.csv(diag_combined, file.path(OUTPUT_DIR, "Multi_GLMM_Diagnostics_Raw.csv"),
+            row.names = FALSE)
+  diag_summary <- diag_combined %>%
+    dplyr::group_by(Variant, MissMech) %>%
+    dplyr::summarise(
+      N_fits          = dplyr::n(),
+      Pct_fitted      = round(100 * mean(ok), 2),            # model returned
+      Pct_conv_warn   = round(100 * mean(conv_warn, na.rm = TRUE), 2),
+      Pct_singular    = round(100 * mean(singular,  na.rm = TRUE), 2),
+      Pct_clean       = round(100 * mean(ok & !conv_warn & !singular, na.rm = TRUE), 2),
+      Pct_rung1       = round(100 * mean(rung == 1, na.rm = TRUE), 2),
+      Mean_fit_sec    = round(mean(fit_sec, na.rm = TRUE), 3),
+      .groups = "drop")
+  write.csv(diag_summary, file.path(OUTPUT_DIR, "Multi_GLMM_Diagnostics_Summary.csv"),
+            row.names = FALSE)
+  cat("\n=== GLMM convergence / singularity diagnostics ===\n")
+  print(as.data.frame(diag_summary))
+  
+  dlines <- c("\\begin{table}[!ht]", "  \\centering",
+              "  \\caption{Convergence and singularity diagnostics of the GLMM meta-learners. \\textit{Fitted}: \\texttt{glmer} returned without error; \\textit{Conv.\\ warning}: lme4 reported a gradient/Hessian convergence warning; \\textit{Singular}: \\texttt{lme4::isSingular(tol = 1e-4)}; \\textit{Clean}: fitted, no convergence warning and non-singular.}",
+              "  \\label{tab:glmm_diagnostics}",
+              "  \\begin{tabular}{@{}llrrrrr@{}}", "  \\toprule",
+              "  Model & Mechanism & $N$ & Fitted (\\%) & Conv.\\ warning (\\%) & Singular (\\%) & Clean (\\%) \\\\",
+              "  \\midrule")
+  for (i in seq_len(nrow(diag_summary)))
+    dlines <- c(dlines, sprintf("  %s & %s & %d & %.1f & %.1f & %.1f & %.1f \\\\",
+                                diag_summary$Variant[i], diag_summary$MissMech[i],
+                                diag_summary$N_fits[i], diag_summary$Pct_fitted[i],
+                                diag_summary$Pct_conv_warn[i], diag_summary$Pct_singular[i],
+                                diag_summary$Pct_clean[i]))
+  dlines <- c(dlines, "  \\bottomrule", "  \\end{tabular}", "\\end{table}")
+  writeLines(dlines, file.path(OUTPUT_DIR, "Multi_GLMM_Diagnostics_Table.tex"))
+  cat("Saved: Multi_GLMM_Diagnostics_Raw.csv / _Summary.csv / _Table.tex\n")
+}
+# --- 21. Summaries -----------------------------------------------------------
 per_ds_summ <- combined %>%
   dplyr::group_by(Dataset, MissMech, MissRate, Method, Classifier) %>%
   dplyr::summarise(
@@ -1064,17 +1485,12 @@ grand_summ <- combined %>%
 write.csv(grand_summ,
           file.path(OUTPUT_DIR, "Multi_HAS_grand_summary.csv"), row.names = FALSE)
 cat("Saved: summaries\n")
-# --- 16. Wilcoxon Signed-Rank Tests -------------------------------------------
-# NOTE: Updated to the FULL 30-comparison family (6 baselines x 5 classifiers):
-# CCA, MeanSI, KNN, RFI, MICE-PMM, and MIE-SE, each crossed with J48/NB/PART/SMO/RF.
-# This matches the design reported throughout the paper (Section 2.8). Each
-# (MissRate x Mechanism x Metric) combination corresponds to one of the 20
-# "strata" referred to in the paper's Discussion (Section 2.8 defines this
-# term as the 5 rates x 2 mechanisms x 2 metrics combinations). CCA and
-# MICE-PMM are included in the formal Wilcoxon family for completeness,
-# notwithstanding the two caveats noted there (CCA discards the missingness
-# mechanism entirely; MICE-PMM is one of the four MICE base methods pooled
-# inside MICE-GLMM-Stack itself).
+# --- 22. Wilcoxon Signed-Rank Tests ------------------------------------------
+# MICE-GLMM-Stack is compared with 6 methods x 5 classifiers = 30 competitors
+# (CCA, MeanSI, KNN, RFI, MICE-PMM, MIE-SE). Performance is first averaged
+# over the 10 splits of each dataset (15 paired observations per test).
+# Bonferroni correction over the 30 comparisons within each rate x mechanism
+# x metric stratum (20 strata).
 # Reporting order matches the paper's Wilcoxon tables (Tables 5-6, S21-S40):
 # CCA first (no imputation), then single imputation (MeanSI, KNN, RFI),
 # then MICE-PMM (multiple imputation), then MIE-SE (stacking).
@@ -1159,7 +1575,7 @@ cat("Saved: Multi_HAS_wilcoxon.csv\n")
 cat("\n=== Wilcoxon Summary (AUC, 30%) ===\n")
 print(wilcox_df[wilcox_df$Metric == "AUC" & abs(wilcox_df$MissRate - 0.30) < 1e-6, ],
       row.names = FALSE)
-# --- 16a. LaTeX Helper Functions ---------------------------------------------
+# --- 23. LaTeX Helper Functions ----------------------------------------------
 method_tex <- function(meth)
   switch(as.character(meth),
          `MICE-GLMM-Stack` = "\\textbf{MICE-GLMM-Stack}",
@@ -1270,7 +1686,7 @@ make_grand_table <- function(gs, metric="AUC") {
       "MICE base method on its own. \\textit{CCA}: complete case analysis (listwise " %.%
       "deletion of training rows with any missing predictor cell, no imputation). " %.%
       "\\textit{Complete}: complete-data reference with no induced missingness. " %.%
-      "\\textit{MICE-GLMM-Stack}: pooled 3-random-effect GLMM meta-learner spanning all " %.%
+      "\\textit{MICE-GLMM-Stack}: GLMM meta-learner with crossed random effects, spanning all " %.%
       "classifiers and all 4 MICE base methods (pmm/cart/norm/rf) internally, aggregated " %.%
       "jointly; only MICE-PMM among these 4 base methods is also reported as its own " %.%
       "standalone competitor row. " %.%
@@ -1278,6 +1694,7 @@ make_grand_table <- function(gs, metric="AUC") {
       "Missing data were induced independently under each of: %s.",
     metric, N_SPLITS, note, primary_note,
     paste(sapply(MISS_MECHS, function(m) unname(mech_labels[m])), collapse = "; "))
+  gs <- gs %>% dplyr::filter(Method %in% METHOD_ORDER)   # without ablation rows
   build_latex_table(pivot_wide_ms(gs, metric), metric, cap,
                     sprintf("tab:grand_%s", tolower(metric)))
 }
@@ -1287,7 +1704,8 @@ make_per_dataset_table <- function(ds_name, metric="AUC") {
     "%s: mean %s ($\\text{mean}\\pm\\text{SD}$) over %d stratified train--test splits " %.%
       "(70/30; %s). Boldface indicates the best-performing method per column.",
     gsub("_"," ",ds_name), metric, N_SPLITS, note)
-  df_ds <- per_ds_summ %>% dplyr::filter(Dataset == ds_name)
+  df_ds <- per_ds_summ %>% dplyr::filter(Dataset == ds_name,
+                                         Method %in% METHOD_ORDER)
   if (nrow(df_ds) == 0) return("")
   build_latex_table(pivot_wide_ms(df_ds, metric), metric, cap,
                     sprintf("tab:%s_%s", gsub("[^A-Za-z0-9]","",ds_name), tolower(metric)))
@@ -1299,7 +1717,7 @@ latex_preamble <- function(fs=10)
     "\\usepackage[table]{xcolor}",
     "\\geometry{margin=1.2cm,landscape,a3paper}",
     "\\begin{document}","")
-# --- 16b. LaTeX Tables: one per mechanism x metric x rate --------------------
+# --- 24. LaTeX Tables: one per mechanism x metric x rate ---------------------
 make_wilcoxon_latex_rate <- function(wdf, metric_sel, miss_rate, miss_mech = "MCAR",
                                      stack_method = "MICE-GLMM-Stack",
                                      first_ref_label = NULL) {
@@ -1315,13 +1733,13 @@ make_wilcoxon_latex_rate <- function(wdf, metric_sel, miss_rate, miss_mech = "MC
   if (is.na(mech_desc) || is.null(mech_desc)) mech_desc <- miss_mech
   
   direction_note <- if (metric_sel == "AUC")
-    sprintf("Positive mean diff.\\ = %s wins. $H_1$: AUC(%s) $>$ AUC(Competitor).",
+    sprintf("Positive mean diff.\\ = %s wins. Two-sided test, $H_1$: AUC(%s) $\\neq$ AUC(Competitor).",
             stack_method, stack_method)
   else
-    sprintf("Negative mean diff.\\ = %s wins (lower Brier). $H_1$: Brier(%s) $<$ Brier(Competitor).",
+    sprintf("Negative mean diff.\\ = %s wins (lower Brier). Two-sided test, $H_1$: Brier(%s) $\\neq$ Brier(Competitor).",
             stack_method, stack_method)
   
-  re_desc <- "single 3-random-effect GLMM per split, pooling classifier, MICE method, and imputation draw -- see Sec.9c"
+  re_desc <- "one GLMM per split with crossed random effects for classifier and MICE method"
   
   n_ds <- length(unique(combined$Dataset))
   if (is.null(first_ref_label)) {
@@ -1425,7 +1843,7 @@ for (mech in MISS_MECHS) {
   cat(sprintf("Saved: %s (10 stack-vs-competitor tables: 5 rates x 2 metrics, 30 rows each)\n",
               wilcox_tex_file))
 }
-# --- 17. LaTeX Tables: grand and per-dataset output --------------------------
+# --- 25. LaTeX Tables: grand and per-dataset output --------------------------
 tex_file  <- file.path(OUTPUT_DIR, "Multi_HAS_grand_tables.tex")
 tex_lines <- latex_preamble(10)
 for (met in c("AUC","Brier"))
@@ -1439,7 +1857,7 @@ for (ds_name in unique(combined$Dataset))
     ds_tex_lines <- c(ds_tex_lines, make_per_dataset_table(ds_name, met))
 ds_tex_lines <- c(ds_tex_lines, "\\end{document}")
 writeLines(ds_tex_lines, ds_tex_file); cat(sprintf("Saved: %s\n", ds_tex_file))
-# --- 18. Figures ---------------------------------------------------------------
+# --- 26. Figures -------------------------------------------------------------
 colour_pal <- c(
   Complete    = "#9E9E9E", MeanSI      = "#795548", KNN         = "#FF9800",
   RFI         = "#8BC34A", CCA         = "#607D8B",
@@ -1482,7 +1900,7 @@ theme_paper <- function(base = 9)
     axis.text         = element_text(size = rel(0.85))
   )
 clf_raw <- combined %>%
-  dplyr::filter(Method %in% METHOD_ORDER, MissMech == "MCAR") %>%
+  dplyr::filter(Method %in% METHOD_ORDER, MissMech == MISS_MECHS[1]) %>%
   dplyr::group_by(MissRate, Method, Classifier) %>%
   dplyr::summarise(Mean_AUC   = mean(AUC,   na.rm = TRUE),
                    SD_AUC     = sd(AUC,     na.rm = TRUE),
@@ -1611,7 +2029,7 @@ grand_summ %>%
   dplyr::select(MissMech, Method, Classifier, AUC_mean, Brier_mean) %>%
   as.data.frame() %>% print(row.names=FALSE)
 cat("\n=== DONE ===\n")
-# --- 20. Kendall's W Rank Tables ----------------------------------------------
+# --- 27. Kendall's W Rank Tables ---------------------------------------------
 compute_kendall_W <- function(rank_mat) {
   n <- nrow(rank_mat)
   k <- ncol(rank_mat)
@@ -1648,6 +2066,7 @@ build_rank_table <- function(data_in, miss_rate_val, metric = "AUC",
   sub <- data_in %>%
     dplyr::filter(
       Method != "Complete" &
+        Method %in% METHOD_ORDER &          # without ablation rows
         abs(MissRate - miss_rate_val) < 1e-6
     )
   
@@ -1665,7 +2084,7 @@ build_rank_table <- function(data_in, miss_rate_val, metric = "AUC",
       MethodClf = paste(Method, Classifier, sep = "/")
     )
   
-  # Reporting order matches the paper's rank tables (Supplementary S1-S20):
+  # reporting order of the rank tables (Supplementary Tables S1-S20):
   # CCA first, then single imputation, then MICE-PMM, then MIE-SE, then the
   # proposed MICE-GLMM-Stack.
   row_order <- c(
@@ -2004,32 +2423,308 @@ for (mech in MISS_MECHS) {
          plot = p8, width = 16, height = 7, units = "in", device = cairo_pdf)
   cat(sprintf("Saved: %s (.png 900 dpi + .pdf)\n", fig8_file))
 }
-if (exists("varcomp_combined") && !is.null(varcomp_combined) && nrow(varcomp_combined) > 0) {
-  vc_plot_dat <- varcomp_combined %>%
-    dplyr::filter(Component != "Classifier -- slope/intercept covariance") %>%
-    dplyr::mutate(RungLabel = factor(
-      paste0("Rung ", FormulaRung),
-      levels = paste0("Rung ", sort(unique(FormulaRung)))))
+# --- 28. Random-effect figure ------------------------------------------------
+#   panel A: random-effect SDs, with the slope-intercept correlation separately
+#   panel C: classifier random-effect SD as a function of x = logit(p)
+# (panel B, the variance share, is close to 100% and is given in the CSV only)
+if (exists("vdec_summary") && nrow(vdec_summary) > 0) {
+  figA_dat <- vdec_summary %>%
+    dplyr::select(MissMech, SD_intercept, SD_slope, SD_method, SD_draw, Corr_int_slope) %>%
+    tidyr::pivot_longer(-MissMech, names_to = "Comp", values_to = "Value") %>%
+    # no draw term in the 20-stream model
+    dplyr::filter(!(MAIN_STREAMS == "S20" & Comp == "SD_draw")) %>%
+    dplyr::mutate(
+      Panel = ifelse(Comp == "Corr_int_slope", "Correlation", "SD (logit link scale)"),
+      Comp  = factor(dplyr::recode(Comp,
+                                   SD_intercept = "Classifier intercept",
+                                   SD_slope     = "Classifier slope (logit p)",
+                                   SD_method    = "Imputation method",
+                                   SD_draw      = "Draw within method",
+                                   Corr_int_slope = "Classifier slope-intercept corr."),
+                     levels = c("Classifier slope (logit p)", "Classifier intercept",
+                                "Imputation method", "Draw within method",
+                                "Classifier slope-intercept corr.")))
+  pA <- ggplot(figA_dat, aes(x = Comp, y = Value, fill = MissMech)) +
+    geom_col(position = position_dodge(0.75), width = 0.7) +
+    geom_text(aes(label = sprintf("%.3f", Value)), position = position_dodge(0.75),
+              vjust = -0.3, size = 2.6, family = "serif") +
+    facet_grid(~ Panel, scales = "free", space = "free_x") +
+    labs(title = "(A) Random-effect standard deviations and correlation",
+         x = NULL, y = NULL) +
+    theme_paper() + theme(axis.text.x = element_text(angle = 20, hjust = 1))
   
-  p9 <- ggplot(vc_plot_dat, aes(x = Component, y = sdcor, fill = Component)) +
-    geom_boxplot(outlier.size = 0.6, linewidth = 0.35, width = 0.65) +
-    facet_grid(MissMech ~ RungLabel, scales = "free_x") +
-    scale_fill_brewer(palette = "Set2") +
-    labs(title   = "Empirical Variance-Component Estimates: Pooled MICE-GLMM-Stack Random Effects",
-         caption = "Each box: link-scale SD (or slope/intercept correlation) of one random-effects component, over every converged train-test split. Faceted by missingness mechanism (rows) and which fallback rung (Sec.2.4) converged (columns).",
-         x = NULL, y = "Estimated SD (link scale)") +
-    theme_paper() +
-    theme(axis.text.x   = element_text(angle = 35, hjust = 1, size = 6.5),
-          legend.position = "none")
+  figB_dat <- vdec_summary %>%
+    dplyr::select(MissMech, Share_clf_pct, Share_meth_pct, Share_draw_pct) %>%
+    tidyr::pivot_longer(-MissMech, names_to = "Source", values_to = "Pct") %>%
+    dplyr::filter(!(MAIN_STREAMS == "S20" & Source == "Share_draw_pct")) %>%
+    dplyr::mutate(Source = factor(dplyr::recode(Source,
+                                                Share_clf_pct  = "Classifier (averaged over x)",
+                                                Share_meth_pct = "Imputation method",
+                                                Share_draw_pct = "Draw within method"),
+                                  levels = c("Draw within method", "Imputation method",
+                                             "Classifier (averaged over x)")))
+  pB <- ggplot(figB_dat, aes(x = MissMech, y = Pct, fill = Source)) +
+    geom_col(width = 0.55) +
+    geom_text(aes(label = ifelse(Pct >= 1, sprintf("%.1f%%", Pct), "")),
+              position = position_stack(vjust = 0.5), size = 3, family = "serif") +
+    labs(title = "(B) Share of random-effects variance",
+         caption = "Classifier variance = s0^2 + 2E[x]s01 + E[x^2]s1^2, x = logit(p), averaged over each split's training streams.",
+         x = NULL, y = "Share (%)") +
+    theme_paper()
   
-  ggsave(file.path(OUTPUT_DIR, "fig9_variance_components.png"),
-         plot = p9, width = 14, height = 6 * length(unique(vc_plot_dat$MissMech)),
-         units = "in", dpi = 900, limitsize = FALSE)
-  ggsave(file.path(OUTPUT_DIR, "fig9_variance_components.pdf"),
-         plot = p9, width = 14, height = 6 * length(unique(vc_plot_dat$MissMech)),
-         units = "in", device = cairo_pdf, limitsize = FALSE)
-  cat("Saved: fig9_variance_components (.png 900 dpi + .pdf)\n")
-} else {
-  cat("[WARN] No variance-component data captured -- skipping fig9_variance_components.\n")
+  par_mech <- per_split_vc %>% dplyr::group_by(MissMech) %>%
+    dplyr::summarise(s0sq = mean(s0sq), s1sq = mean(s1sq), s01 = mean(s01),
+                     v_meth = mean(v_meth),
+                     q25 = mean(x_q25), q50 = mean(x_q50), q75 = mean(x_q75),
+                     .groups = "drop")
+  # x-axis limited to the observed range (quartiles -/+ 1)
+  x_grid <- seq(floor(min(par_mech$q25)) - 1, ceiling(max(par_mech$q75)) + 1, by = 0.05)
+  figC_dat <- purrr::map_dfr(seq_len(nrow(par_mech)), function(i) {
+    pm <- par_mech[i, ]
+    data.frame(MissMech = pm$MissMech, x = x_grid,
+               SD = sqrt(pmax(pm$s0sq + 2 * x_grid * pm$s01 + x_grid^2 * pm$s1sq, 0)))
+  })
+  q_lines <- par_mech %>% tidyr::pivot_longer(c(q25, q50, q75), names_to = "q", values_to = "x")
+  # classifier SD as a function of x, with the (constant) method SD as a
+  # dotted line; all SDs are sqrt(mean variance), as in panel A
+  meth_lines <- par_mech %>% dplyr::transmute(MissMech, SD_method = sqrt(v_meth))
+  pC <- ggplot(figC_dat, aes(x = x, y = SD, colour = MissMech)) +
+    geom_line(linewidth = 0.9) +
+    geom_hline(data = meth_lines, aes(yintercept = SD_method, colour = MissMech),
+               linetype = "dotted", linewidth = 0.6) +
+    geom_vline(data = q_lines, aes(xintercept = x, colour = MissMech),
+               linetype = "dashed", linewidth = 0.3) +
+    labs(title = "(C) Classifier random-effect SD as a function of x = logit(p)",
+         caption = paste("Solid: classifier SD = sqrt(s0^2 + 2x s01 + x^2 s1^2).",
+                         "Dotted: imputation-method SD (constant in x).",
+                         "Dashed: average 25th/50th/75th percentiles of training logit(p)."),
+         x = "x = logit(p)", y = "SD (logit link scale)") +
+    theme_paper()
+  for (fp in list(list(pA, "fig1rev_A_sd", 9, 4.5),
+                  list(pC, "fig1rev_C_sd_by_x", 7, 4.5))) {
+    ggsave(file.path(OUTPUT_DIR, paste0(fp[[2]], ".png")), plot = fp[[1]],
+           width = fp[[3]], height = fp[[4]], units = "in", dpi = 600)
+    ggsave(file.path(OUTPUT_DIR, paste0(fp[[2]], ".pdf")), plot = fp[[1]],
+           width = fp[[3]], height = fp[[4]], units = "in", device = cairo_pdf)
+  }
+  cat("Saved: fig1rev_A_sd, fig1rev_C_sd_by_x (.png + .pdf)\n")
+  
+  # combined figure: (A) SDs and correlation, (B) classifier SD by x.
+  # Uses patchwork or gridExtra; otherwise only the single panels are saved.
+  pA_f <- pA + labs(title = "(A) Random-effect standard deviations and slope-intercept correlation")
+  pB_f <- pC + labs(title = "(B) Classifier random-effect SD as a function of x = logit(p)")
+  fig1_file <- "fig1_variance_components"
+  if (requireNamespace("patchwork", quietly = TRUE)) {
+    fig1 <- patchwork::wrap_plots(pA_f, pB_f, ncol = 1, heights = c(1, 1.1))
+    ggsave(file.path(OUTPUT_DIR, paste0(fig1_file, ".png")), fig1,
+           width = 9, height = 9, units = "in", dpi = 600)
+    ggsave(file.path(OUTPUT_DIR, paste0(fig1_file, ".pdf")), fig1,
+           width = 9, height = 9, units = "in", device = cairo_pdf)
+    cat("Saved:", fig1_file, "(.png + .pdf)\n")
+  } else if (requireNamespace("gridExtra", quietly = TRUE)) {
+    for (ext in c("png", "pdf")) {
+      if (ext == "png") png(file.path(OUTPUT_DIR, paste0(fig1_file, ".png")),
+                            width = 9, height = 9, units = "in", res = 600)
+      else cairo_pdf(file.path(OUTPUT_DIR, paste0(fig1_file, ".pdf")), width = 9, height = 9)
+      gridExtra::grid.arrange(pA_f, pB_f, ncol = 1, heights = c(1, 1.1))
+      dev.off()
+    }
+    cat("Saved:", fig1_file, "(.png + .pdf)\n")
+  } else {
+    cat("[NOTE] patchwork/gridExtra not installed; only the single panels were saved.\n")
+  }
 }
+
+# --- 29. Ablation results -----------------------------------------------------
+# All meta-learners use the same streams, so the comparison separates the
+# effect of the GLMM from that of pooling many streams.
+ABL_ALL <- c("MICE-GLMM-Stack", ABLATION_METHODS)
+abl_ds <- combined %>%
+  dplyr::filter(Method %in% ABL_ALL, Classifier == "All") %>%
+  dplyr::group_by(Dataset, MissMech, MissRate, Method) %>%
+  dplyr::summarise(AUC = mean(AUC, na.rm = TRUE), Brier = mean(Brier, na.rm = TRUE),
+                   .groups = "drop") %>%
+  dplyr::mutate(Method = as.character(Method))
+if (RUN_ABLATION && nrow(abl_ds) > 0) {
+  abl_grand <- abl_ds %>%
+    dplyr::group_by(MissMech, MissRate, Method) %>%
+    dplyr::summarise(AUC_mean = mean(AUC), AUC_sd = sd(AUC),
+                     Brier_mean = mean(Brier), Brier_sd = sd(Brier), .groups = "drop")
+  write.csv(abl_grand, file.path(OUTPUT_DIR, "Ablation_grand_summary.csv"), row.names = FALSE)
+  
+  # paired Wilcoxon: main model vs each variant, dataset level (n = 15)
+  abl_cmp  <- setdiff(ABLATION_METHODS, character(0))
+  n_comp_a <- length(abl_cmp)       # Bonferroni within each stratum
+  abl_wt <- list()
+  full_ds <- abl_ds %>% dplyr::filter(Method == "MICE-GLMM-Stack") %>%
+    dplyr::select(Dataset, MissMech, MissRate, AUC_f = AUC, Brier_f = Brier)
+  for (v in abl_cmp) {
+    pr <- abl_ds %>% dplyr::filter(Method == v) %>%
+      dplyr::select(Dataset, MissMech, MissRate, AUC_v = AUC, Brier_v = Brier) %>%
+      dplyr::inner_join(full_ds, by = c("Dataset", "MissMech", "MissRate"))
+    for (mech in MISS_MECHS) for (mr in MISS_RATES) for (met in c("AUC", "Brier")) {
+      d <- pr %>% dplyr::filter(MissMech == mech, abs(MissRate - mr) < 1e-6)
+      if (nrow(d) < 2) next
+      a <- d[[paste0(met, "_f")]]; b <- d[[paste0(met, "_v")]]; dv <- a - b
+      wt <- tryCatch(suppressWarnings(wilcox.test(a, b, paired = TRUE, exact = FALSE)),
+                     error = function(e) NULL)
+      pv <- if (is.null(wt) || is.na(wt$p.value)) NA_real_ else wt$p.value
+      better <- if (met == "AUC") dv > 0 else dv < 0
+      worse  <- if (met == "AUC") dv < 0 else dv > 0
+      abl_wt[[length(abl_wt) + 1]] <- data.frame(
+        Variant = v, Metric = met, MissMech = mech, MissRate = mr,
+        mean_diff = mean(dv), sd_diff = sd(dv),
+        p_value = pv, p_adj = if (is.na(pv)) NA_real_ else min(1, pv * n_comp_a),
+        Full_wins = sum(better), Full_losses = sum(worse),
+        Full_win_ratio = round(mean(better), 3),   # share of datasets won
+        stringsAsFactors = FALSE)
+    }
+  }
+  abl_wt <- do.call(rbind, abl_wt)
+  abl_wt$Signif <- ifelse(!is.na(abl_wt$p_adj) & abl_wt$p_adj < 0.05, "*", "ns")
+  write.csv(abl_wt, file.path(OUTPUT_DIR, "Ablation_wilcoxon.csv"), row.names = FALSE)
+  
+  # LaTeX: rows = variant, columns = rates; cell = mean value (+ diff vs full)
+  for (mech in MISS_MECHS) for (met in c("AUC", "Brier")) {
+    g <- abl_grand %>% dplyr::filter(MissMech == mech)
+    rates <- sort(unique(g$MissRate))
+    hb <- met == "AUC"
+    lines <- c("\\begin{table}[!ht]", "  \\centering",
+               sprintf(paste0("  \\caption{Ablation of the meta-learner at fixed input (%s, %s). ",
+                              "All rows are built from the same 100 out-of-fold/test prediction streams ",
+                              "(5 classifiers $\\times$ 4 MICE methods $\\times$ 5 draws); MICE-GLMM-Stack first averages the ",
+                              "5 draws (20 streams per subject). ",
+                              "Cells: mean %s over 15 datasets; ",
+                              "in brackets, mean paired difference (MICE-GLMM-Stack $-$ row) with $^{*}$ = Bonferroni-adjusted ",
+                              "($\\times%d$) Wilcoxon $p<0.05$.}"),
+                       met, unname(mech_labels[mech]), met, n_comp_a),
+               sprintf("  \\label{tab:ablation_%s_%s}", tolower(met), tolower(mech)),
+               "  \\resizebox{\\linewidth}{!}{%",
+               sprintf("  \\begin{tabular}{@{}l%s@{}}", strrep("c", length(rates))),
+               "  \\toprule",
+               sprintf("  Meta-learner & %s \\\\", paste0(round(rates * 100), "\\%", collapse = " & ")),
+               "  \\midrule")
+    for (m in ABL_ALL) {
+      cells <- sapply(rates, function(r) {
+        val <- g[[paste0(met, "_mean")]][g$Method == m & abs(g$MissRate - r) < 1e-6]
+        if (length(val) == 0) return("--")
+        if (m == "MICE-GLMM-Stack") return(sprintf("\\textbf{%.4f}", val))
+        w <- abl_wt[abl_wt$Variant == m & abl_wt$Metric == met & abl_wt$MissMech == mech &
+                      abs(abl_wt$MissRate - r) < 1e-6, ]
+        if (nrow(w) == 0) return(sprintf("%.4f", val))
+        sprintf("%.4f (%+.4f%s)", val, w$mean_diff[1], ifelse(w$Signif[1] == "*", "$^{*}$", ""))
+      })
+      lines <- c(lines, sprintf("  %s & %s \\\\", m, paste(cells, collapse = " & ")))
+    }
+    lines <- c(lines, "  \\bottomrule", "  \\end{tabular}%", "  }", "\\end{table}", "")
+    writeLines(lines, file.path(OUTPUT_DIR, sprintf("Ablation_table_%s_%s.tex", met, mech)))
+  }
+  
+  pabl <- abl_wt %>%
+    dplyr::mutate(Variant = factor(Variant, levels = ABLATION_METHODS)) %>%
+    ggplot(aes(x = MissRate * 100, y = mean_diff, colour = Variant, shape = Signif)) +
+    geom_hline(yintercept = 0, linetype = "dashed", colour = "grey50") +
+    geom_line(aes(group = Variant), linewidth = 0.6) + geom_point(size = 2) +
+    facet_grid(Metric ~ MissMech, scales = "free_y") +
+    scale_shape_manual(values = c(`*` = 16, ns = 1)) +
+    labs(title = "Ablation: MICE-GLMM-Stack minus each alternative meta-learner (same input streams)",
+         caption = "AUC: positive = full model better. Brier: negative = full model better. Filled = Bonferroni p < 0.05.",
+         x = "Missingness rate (%)", y = "Mean paired difference") +
+    theme_paper()
+  ggsave(file.path(OUTPUT_DIR, "fig_ablation.png"), pabl, width = 10, height = 6, dpi = 600)
+  ggsave(file.path(OUTPUT_DIR, "fig_ablation.pdf"), pabl, width = 10, height = 6, device = cairo_pdf)
+  cat("Saved: Ablation_grand_summary.csv, Ablation_wilcoxon.csv, Ablation_table_*.tex, fig_ablation\n")
+  cat("\n=== Ablation: AUC difference (full - variant), averaged over rates ===\n")
+  print(abl_wt %>% dplyr::filter(Metric == "AUC") %>%
+          dplyr::group_by(MissMech, Variant) %>%
+          dplyr::summarise(mean_diff = round(mean(mean_diff), 4),
+                           n_signif = sum(Signif == "*"), .groups = "drop") %>%
+          as.data.frame())
+}
+
+# --- 30. Split-level mixed-model test ----------------------------------------
+# The Wilcoxon tests use dataset-level means (Demsar 2006). As a sensitivity
+# analysis the split-level paired differences are modelled as
+#     diff_{ds,split} = beta0 + u_ds + e,   u_ds ~ N(0, tau^2)
+# with a random intercept for dataset, because splits of the same dataset
+# share subjects. Test of beta0 = 0: t statistic with df = n_datasets - 1,
+# Bonferroni over 30 comparisons as for the Wilcoxon tests.
+split_lvl <- combined %>%
+  dplyr::filter(MissRate > 0) %>%
+  dplyr::select(Dataset, MissMech, MissRate, Split, Method, Classifier, AUC, Brier) %>%
+  dplyr::mutate(Method = as.character(Method))
+stack_sl <- split_lvl %>% dplyr::filter(Method == "MICE-GLMM-Stack", Classifier == "All") %>%
+  dplyr::select(Dataset, MissMech, MissRate, Split, AUC_s = AUC, Brier_s = Brier)
+mm_rows <- list()
+for (meth in INNER_FAMILY_METHODS) for (cl in CLF_NAMES) {
+  comp <- split_lvl %>% dplyr::filter(Method == meth, Classifier == cl) %>%
+    dplyr::select(Dataset, MissMech, MissRate, Split, AUC_c = AUC, Brier_c = Brier) %>%
+    dplyr::inner_join(stack_sl, by = c("Dataset", "MissMech", "MissRate", "Split"))
+  for (mech in MISS_MECHS) for (mr in MISS_RATES) for (met in c("AUC", "Brier")) {
+    d <- comp %>% dplyr::filter(MissMech == mech, abs(MissRate - mr) < 1e-6)
+    if (nrow(d) < 4) next
+    d$diff <- d[[paste0(met, "_s")]] - d[[paste0(met, "_c")]]
+    n_ds   <- length(unique(d$Dataset))
+    est <- se <- NA_real_
+    fit <- tryCatch(suppressMessages(lme4::lmer(diff ~ 1 + (1 | Dataset), data = d)),
+                    error = function(e) NULL)
+    if (!is.null(fit)) {
+      cf  <- summary(fit)$coefficients
+      est <- cf[1, "Estimate"]; se <- cf[1, "Std. Error"]
+    }
+    tval <- est / se
+    pv   <- if (is.na(tval)) NA_real_ else 2 * pt(-abs(tval), df = max(1, n_ds - 1))
+    mm_rows[[length(mm_rows) + 1]] <- data.frame(
+      Metric = met, MissMech = mech, MissRate = mr, Competitor = meth, CompetitorClf = cl,
+      n_splits = nrow(d), n_datasets = n_ds, estimate = est, se = se, t = tval,
+      p_value = pv, p_adj = if (is.na(pv)) NA_real_ else min(1, pv * n_comp),
+      stringsAsFactors = FALSE)
+  }
+}
+if (length(mm_rows) > 0) {
+  mm_df <- do.call(rbind, mm_rows)
+  mm_df$Signif_MM <- ifelse(!is.na(mm_df$p_adj) & mm_df$p_adj < 0.05, "*", "ns")
+  # agreement with the Wilcoxon tests
+  agree <- mm_df %>%
+    dplyr::left_join(wilcox_df %>% dplyr::select(Metric, MissMech, MissRate, Competitor,
+                                                 CompetitorClf, Signif_W = Signif),
+                     by = c("Metric", "MissMech", "MissRate", "Competitor", "CompetitorClf")) %>%
+    dplyr::mutate(Signif_W = ifelse(Signif_W == "ns", "ns", "*"))
+  write.csv(agree, file.path(OUTPUT_DIR, "SplitLevel_MixedModel_tests.csv"), row.names = FALSE)
+  agree_tab <- agree %>% dplyr::count(Metric, MissMech, Signif_W, Signif_MM)
+  write.csv(agree_tab, file.path(OUTPUT_DIR, "SplitLevel_vs_Wilcoxon_agreement.csv"),
+            row.names = FALSE)
+  cat("\n=== Split-level mixed model vs dataset-level Wilcoxon: agreement ===\n")
+  print(as.data.frame(agree_tab))
+}
+
+# --- 31. Metric check: pROC vs Metrics (AUC), DescTools vs formula (Brier) ---
+if (all(c("AUC_Metrics", "Brier_formula") %in% names(combined))) {
+  lib_chk <- combined %>% dplyr::summarise(
+    N = dplyr::n(),
+    Max_absdiff_AUC_pROC_vs_Metrics = max(abs(AUC - AUC_Metrics), na.rm = TRUE),
+    N_AUC_diff_gt_1e8 = sum(abs(AUC - AUC_Metrics) > 1e-8, na.rm = TRUE),
+    Max_absdiff_Brier_lib_vs_formula = max(abs(Brier - Brier_formula), na.rm = TRUE))
+  write.csv(lib_chk, file.path(OUTPUT_DIR, "Metric_library_check.csv"), row.names = FALSE)
+  cat("\n=== Metric check (both differences should be ~0) ===\n")
+  print(as.data.frame(lib_chk))
+}
+
+# --- 32. Runtime summary -----------------------------------------------------
+if (exists("timing_combined") && !is.null(timing_combined) && nrow(timing_combined) > 0) {
+  cost <- timing_combined %>% dplyr::group_by(MissMech, Method) %>%
+    dplyr::summarise(N = dplyr::n(), Mean_sec = mean(RunTime_sec), SD_sec = sd(RunTime_sec),
+                     Median_sec = median(RunTime_sec), Total_hours = sum(RunTime_sec) / 3600,
+                     .groups = "drop")
+  write.csv(cost, file.path(OUTPUT_DIR, "Computation_Cost_Summary.csv"), row.names = FALSE)
+  cost_n <- timing_combined %>% dplyr::filter(Method == "Split_Total_AllMethods") %>%
+    dplyr::group_by(Dataset, n_train, p) %>%
+    dplyr::summarise(Mean_split_sec = mean(RunTime_sec), .groups = "drop") %>%
+    dplyr::arrange(n_train)
+  write.csv(cost_n, file.path(OUTPUT_DIR, "Computation_Cost_by_Dataset.csv"), row.names = FALSE)
+  cat("\n=== Computation cost (seconds per split, mean) ===\n")
+  print(as.data.frame(cost))
+}
+cat(sprintf("\n=== TOTAL WALL TIME: %.2f hours ===\n",
+            as.numeric(difftime(Sys.time(), RUN_T0, units = "hours"))))
 cat("\n=== ALL DONE (incl. Kendall's W rank tables) ===\n")
